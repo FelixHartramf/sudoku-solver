@@ -1,0 +1,3 @@
+(function() {var implementors = {
+"lib":[["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.73.0/core/panic/unwind_safe/trait.UnwindSafe.html\" title=\"trait core::panic::unwind_safe::UnwindSafe\">UnwindSafe</a> for <a class=\"struct\" href=\"lib/struct.Moves.html\" title=\"struct lib::Moves\">Moves</a>",1,["lib::Moves"]],["impl <a class=\"trait\" href=\"https://doc.rust-lang.org/1.73.0/core/panic/unwind_safe/trait.UnwindSafe.html\" title=\"trait core::panic::unwind_safe::UnwindSafe\">UnwindSafe</a> for <a class=\"struct\" href=\"lib/struct.Sudoku.html\" title=\"struct lib::Sudoku\">Sudoku</a>",1,["lib::Sudoku"]]]
+};if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()
