@@ -8,7 +8,7 @@ It solves Sudokus (fast?). All sudokus I use for testing a solved in less than 5
 - fast Sudoku solving
 
 
-## usage 
+## Usage 
 To solve a Sudoku run:
 ```
 ./sudoku [file]
@@ -62,4 +62,7 @@ This is a explorative project. I used it to learn about Rust and some of the fea
 - More solving strategies for solving (e.g. twins, dripples, X-Wing)
 - Multithreading for faster solving? The time it takes to manage the threads might be higher than the time that is saved due to multithreading. But it needs to be tested.
 - Support for other Sudoku variant (e.g. Killer Sudoku)
-- player Moves arent counted as aspected
+- Player Moves aren't counted as aspected
+
+## Help me get better
+I still need to learn a lot about Rust, good documentation, naming, programm structure and more. So if you have any suggestions please open a Issue.
