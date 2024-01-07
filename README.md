@@ -69,7 +69,7 @@ This is a explorative project. I used it to learn about Rust and some of the fea
     - [x] X Sudoku
     - [ ] Killer Sudoku
     - [ ] Hyper Sudoku
-    - [ ] Even-Odd Sudoku
+    - [x] Even-Odd Sudoku
     - [ ] Comparison Sudoku
 - [ ] Player Moves aren't counted as aspected
 

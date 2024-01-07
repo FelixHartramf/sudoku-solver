@@ -17,9 +17,7 @@ mod impl_sudoku_test {
             assert!(sudoku.is_solved());
 
             let mut sudoku = FastSudoku::from_file(sudoku_path);
-            println!("{}", sudoku);
             sudoku.solve();
-            println!("{}", sudoku);
             assert!(sudoku.is_part_correct());
             assert!(sudoku.is_correct());
             assert!(sudoku.is_solved());

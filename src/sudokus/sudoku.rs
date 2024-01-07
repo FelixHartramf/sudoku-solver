@@ -3,6 +3,7 @@ use std::fs;
 use std::fmt::Debug;
 use crate::sudokus::SudokuRule;
 
+use super::even_odd_sudoku::EvenOddSudoku;
 use super::x_sudoku::XSudoku;
 
 #[derive(Debug, Clone)]
@@ -90,7 +91,7 @@ impl Sudoku {
     /// {website}-{date of retival}-{level}-{solved/unsolved}
     ///
     /// For data structure see Sudoku::from_file
-    pub const UNSOLVED_SUDOKU_FILES: [&'static str; 9] = [
+    pub const UNSOLVED_SUDOKU_FILES: [&'static str; 12] = [
         "test-sudokus/text/tagesspiegel-23-11-11-easy-unsolved",
         "test-sudokus/text/welt-23-11-11-medium-unsolved",
         "test-sudokus/text/welt-23-11-11-hard-unsolved",
@@ -100,9 +101,12 @@ impl Sudoku {
         "test-sudokus/text/sudoku-com-12-11-12-2-master-unsolved",
         "test-sudokus/text/wikipedia-17-given-unsolved",
         "test-sudokus/text/sudoku-com-24-01-06-x-sudoku-easy-unsolved",
+        "test-sudokus/text/sudoku-com-24-01-06-x-sudoku-master-unsolved",
+        "test-sudokus/text/sudokuzok-de-24-01-07-evenodd-easy-unsolved",
+        "test-sudokus/text/sudokuzok-de-24-01-07-evenodd-extra-hard-unsolved"
     ];
 
-    pub const SUDOKUS_WITH_SOLUTION: [[&'static str; 2]; 6] = [
+    pub const SUDOKUS_WITH_SOLUTION: [[&'static str; 2]; 8] = [
         // Normal
         ["test-sudokus/text/sudoku-com-12-11-12-master-unsolved", "test-sudokus/text/sudoku-com-12-11-12-master-solved"],
         ["test-sudokus/text/welt-23-11-11-medium-unsolved", "test-sudokus/text/welt-23-11-11-medium-solved"],
@@ -112,6 +116,10 @@ impl Sudoku {
         // X-Sudoku
         ["test-sudokus/text/sudoku-com-24-01-06-x-sudoku-easy-unsolved", "test-sudokus/text/sudoku-com-24-01-06-x-sudoku-easy-solved"],
         ["test-sudokus/text/sudoku-com-24-01-06-x-sudoku-master-unsolved", "test-sudokus/text/sudoku-com-24-01-06-x-sudoku-master-solved"],
+
+        // Even-Odd-Sudoku
+        ["test-sudokus/text/sudokuzok-de-24-01-07-evenodd-easy-unsolved", "test-sudokus/text/sudokuzok-de-24-01-07-evenodd-easy-solved"],
+        ["test-sudokus/text/sudokuzok-de-24-01-07-evenodd-extra-hard-unsolved", "test-sudokus/text/sudokuzok-de-24-01-07-evenodd-extra-hard-solved"]
     ];
 
     /// Returns an empty Sudoku
@@ -187,6 +195,10 @@ impl Sudoku {
 
             if data.contains(XSudoku::str_identifier()){
                 sudoku.rules.push(XSudoku::from_str(data));
+            }
+
+            if data.contains(EvenOddSudoku::str_identifier()){
+                sudoku.rules.push(EvenOddSudoku::from_str(data));
             }
         }
         return sudoku;
