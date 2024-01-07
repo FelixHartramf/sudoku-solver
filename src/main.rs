@@ -1,6 +1,6 @@
 use std::env;
 
-use sudoku::Sudoku;
+use sudoku::sudokus::Sudoku;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
