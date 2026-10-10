@@ -1,54 +1,60 @@
+use sudoku::sample_files;
+use sudoku::sudokus::{FastSudoku, Sudoku};
 
-#[cfg(test)]
-mod impl_sudoku_test {
+#[test]
+fn solve() {
+    for path in sample_files::unsolved() {
+        let mut sudoku = Sudoku::from_file(path).unwrap();
 
-    use sudoku::sudokus::{Sudoku, FastSudoku};
-
-    
-    #[test]
-    fn solve() {
-
-        for sudoku_path in Sudoku::UNSOLVED_SUDOKU_FILES {
-            let mut sudoku = Sudoku::from_file(sudoku_path);
-
-            sudoku.solve();
-            assert!(sudoku.is_part_correct());
-            assert!(sudoku.is_correct());
-            assert!(sudoku.is_solved());
-
-            let mut sudoku = FastSudoku::from_file(sudoku_path);
-            sudoku.solve();
-            assert!(sudoku.is_part_correct());
-            assert!(sudoku.is_correct());
-            assert!(sudoku.is_solved());
-        }
+        assert!(sudoku.solve(), "{path}");
+        assert!(sudoku.is_part_correct(), "{path}");
+        assert!(sudoku.is_solved(), "{path}");
+        assert!(sudoku.is_correct(), "{path}");
     }
 
-    #[test]
-    fn file_cross_check() {
-        for  path in Sudoku::SUDOKUS_WITH_SOLUTION {
-            let mut sudoku_unsolved = Sudoku::from_file(path[0]);
-            let sudoku_solved = Sudoku::from_file(path[1]);
+    for path in sample_files::CLASSIC_UNSOLVED {
+        let mut sudoku = FastSudoku::from_file(path).unwrap();
 
-            sudoku_unsolved.solve();
-
-            assert_eq!(sudoku_solved, sudoku_unsolved);
-        }
+        assert!(sudoku.solve(), "{path}");
+        assert!(sudoku.is_correct(), "{path}");
     }
+}
 
-    #[test]
-    fn implementation_cross_check() {
+#[test]
+fn file_cross_check() {
+    for (unsolved, solved) in sample_files::WITH_SOLUTION {
+        let mut sudoku = Sudoku::from_file(unsolved).unwrap();
+        let solution = Sudoku::from_file(solved).unwrap();
 
-        // For a classic sudoku both should have the same implementation
-        for path in FastSudoku::UNSOLVED_SUDOKU_FILES {
-            let mut fast_sudoku = FastSudoku::from_file(path);
-            let mut sudoku = Sudoku::from_file(path);
-
-            fast_sudoku.solve();
-            sudoku.solve();
-
-            assert_eq!(fast_sudoku.field, sudoku.field);
-        }
-
+        assert!(sudoku.solve(), "{unsolved}");
+        assert_eq!(sudoku, solution, "{unsolved}");
     }
+}
+
+#[test]
+fn implementation_cross_check() {
+    // For a classic sudoku both have to find the same solution
+    for path in sample_files::CLASSIC_UNSOLVED {
+        let mut fast_sudoku = FastSudoku::from_file(path).unwrap();
+        let mut sudoku = Sudoku::from_file(path).unwrap();
+
+        fast_sudoku.solve();
+        sudoku.solve();
+
+        assert_eq!(fast_sudoku.field(), sudoku.field(), "{path}");
+        assert_eq!(fast_sudoku.moves(), sudoku.moves(), "{path}");
+    }
+}
+
+#[test]
+fn variant_needs_its_rule() {
+    // Without the diagonals this sudoku has 45 solutions, with them only one
+    let path = "test-sudokus/text/sudoku-com-24-01-06-x-sudoku-master-unsolved";
+    let text = std::fs::read_to_string(path).unwrap();
+    let field = text.split(';').next().unwrap();
+    let classic: Sudoku = field.parse().unwrap();
+
+    assert!(classic.rules().is_empty());
+    assert_eq!(classic.count_solutions(100), 45);
+    assert_eq!(Sudoku::from_file(path).unwrap().count_solutions(100), 1);
 }
