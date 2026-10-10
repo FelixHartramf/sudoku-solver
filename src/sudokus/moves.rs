@@ -19,9 +19,26 @@ pub struct Moves {
     pub failed_missing_moves: u32,
     /// "Set alone" moves that were undone
     pub failed_alone_moves: u32,
+    /// Candidates removed by "Naked pairs"
+    pub pair_eliminations: u32,
+    /// Candidates removed by "X-Wing"
+    pub x_wing_eliminations: u32,
 }
 
 impl Moves {
+    /// No moves at all
+    pub const NONE: Moves = Moves {
+        missing_moves: 0,
+        alone_moves: 0,
+        bruteforce_moves: 0,
+        player_moves: 0,
+        bruteforce_failed_tries: 0,
+        failed_missing_moves: 0,
+        failed_alone_moves: 0,
+        pair_eliminations: 0,
+        x_wing_eliminations: 0,
+    };
+
     /// Returns the number of moves that set a cell of the current field
     pub fn total(&self) -> u32 {
         self.missing_moves + self.alone_moves + self.bruteforce_moves + self.player_moves

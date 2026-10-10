@@ -44,6 +44,17 @@ const fn square_index(row: usize, column: usize) -> usize {
     row / 3 * 3 + column / 3
 }
 
+/// Returns `(first, second, mask)` for every two masks that are equal and have exactly two bits
+fn equal_pairs(masks: [Mask; 9]) -> impl Iterator<Item = (usize, usize, Mask)> {
+    (0..9)
+        .filter(move |&first| masks[first].count_ones() == 2)
+        .flat_map(move |first| {
+            (first + 1..9)
+                .filter(move |&second| masks[second] == masks[first])
+                .map(move |second| (first, second, masks[first]))
+        })
+}
+
 /// The board found a cell or unit that can't be filled anymore
 struct Contradiction;
 
@@ -58,6 +69,8 @@ struct Board {
     rows: [Mask; 9],
     columns: [Mask; 9],
     squares: [Mask; 9],
+    /// Candidates removed by "Naked pairs" and "X-Wing"
+    eliminated: Field,
     unset: u8,
     moves: Moves,
 }
@@ -68,16 +81,9 @@ impl Board {
         rows: [0; 9],
         columns: [0; 9],
         squares: [0; 9],
+        eliminated: [[0; 9]; 9],
         unset: 81,
-        moves: Moves {
-            missing_moves: 0,
-            alone_moves: 0,
-            bruteforce_moves: 0,
-            player_moves: 0,
-            bruteforce_failed_tries: 0,
-            failed_missing_moves: 0,
-            failed_alone_moves: 0,
-        },
+        moves: Moves::NONE,
     };
 
     /// Sets an empty cell
@@ -98,6 +104,8 @@ impl Board {
         }
         self.field[row][column] = 0;
         self.unset += 1;
+        // The eliminations might depend on the cleared cell
+        self.eliminated = [[0; 9]; 9];
         // Recalculate, as the digit could be in a unit twice when a player made a mistake
         self.rows[row] = self.field[row].iter().fold(0, |set, cell| set | cell);
         self.columns[column] = (0..9).fold(0, |set, r| set | self.field[r][column]);
@@ -113,6 +121,7 @@ impl Board {
         let used = self.rows[row]
             | self.columns[column]
             | self.squares[square_index(row, column)]
+            | self.eliminated[row][column]
             | rules.excluded(&self.field, row, column);
         ALL_DIGITS & !used
     }
@@ -186,12 +195,103 @@ impl Board {
     }
 
     /// Uses the logical strategies until they don't find anything anymore
+    /// Removes `digits` from the candidates of an empty cell.
+    ///
+    /// Returns the number of candidates that were removed.
+    #[inline]
+    fn eliminate<R: RuleSet>(&mut self, rules: &R, row: usize, column: usize, digits: Mask) -> u32 {
+        if self.field[row][column] != 0 {
+            return 0;
+        }
+        let removed = self.candidates(rules, row, column) & digits;
+        self.eliminated[row][column] |= removed;
+        removed.count_ones()
+    }
+
+    /// "Naked pairs": If two cells of a row, column or square have the same
+    /// two candidates, these digits have to be in these two cells. So they
+    /// can be removed from all other cells of the unit.
+    ///
+    /// Returns true if a candidate was removed.
+    fn eliminate_naked_pairs<R: RuleSet>(&mut self, rules: &R) -> bool {
+        let mut removed = 0;
+        for unit in &UNITS {
+            let candidates = unit.map(|(row, column)| match self.field[row][column] {
+                0 => self.candidates(rules, row, column),
+                _ => 0,
+            });
+
+            for (first, second, pair) in equal_pairs(candidates) {
+                for (i, &(row, column)) in unit.iter().enumerate() {
+                    if i != first && i != second {
+                        removed += self.eliminate(rules, row, column, pair);
+                    }
+                }
+            }
+        }
+        self.moves.pair_eliminations += removed;
+        removed > 0
+    }
+
+    /// "X-Wing": If a digit is only possible in the same two columns of two
+    /// rows, it has to be in the corners of this rectangle. So it can be
+    /// removed from all other cells of the two columns.
+    /// The same works with rows and columns swapped.
+    ///
+    /// Returns true if a candidate was removed.
+    fn eliminate_x_wings<R: RuleSet>(&mut self, rules: &R) -> bool {
+        let mut removed = 0;
+        for by_rows in [true, false] {
+            // A line is a row (or column), a cross line a column (or row)
+            let cell = |line: usize, cross: usize| {
+                if by_rows {
+                    (line, cross)
+                } else {
+                    (cross, line)
+                }
+            };
+
+            // positions[line][digit]: the cross lines where the digit is possible
+            let mut positions = [[0 as Mask; 9]; 9];
+            for (line, digit_positions) in positions.iter_mut().enumerate() {
+                for cross in 0..9 {
+                    let (row, column) = cell(line, cross);
+                    if self.field[row][column] != 0 {
+                        continue;
+                    }
+                    for digit in bits(self.candidates(rules, row, column)) {
+                        digit_positions[digit.trailing_zeros() as usize] |= 1 << cross;
+                    }
+                }
+            }
+
+            for digit in 0..9 {
+                let lines = positions.map(|digit_positions| digit_positions[digit]);
+                for (first, second, crosses) in equal_pairs(lines) {
+                    for cross in bits(crosses).map(|bit| bit.trailing_zeros() as usize) {
+                        for line in (0..9).filter(|&line| line != first && line != second) {
+                            let (row, column) = cell(line, cross);
+                            removed += self.eliminate(rules, row, column, 1 << digit);
+                        }
+                    }
+                }
+            }
+        }
+        self.moves.x_wing_eliminations += removed;
+        removed > 0
+    }
+
+    /// Uses the logical strategies until they don't find anything anymore.
+    /// The cheap strategies are tried first, every success starts again at the top.
     fn propagate<R: RuleSet>(&mut self, rules: &R) -> Result<(), Contradiction> {
         loop {
-            if self.set_missing_numbers(rules)? {
+            if self.set_missing_numbers(rules)? || self.set_alone_numbers(rules)? {
                 continue;
             }
-            if !self.set_alone_numbers(rules)? {
+            if self.unset == 0 {
+                return Ok(());
+            }
+            if !self.eliminate_naked_pairs(rules) && !self.eliminate_x_wings(rules) {
                 return Ok(());
             }
         }
@@ -603,9 +703,127 @@ impl<R: RuleSet> GenericSudoku<R> {
 
 #[cfg(test)]
 mod sudoku_test {
-    use super::UNITS;
+    use super::{Board, UNITS};
     use crate::sample_files;
-    use crate::sudokus::{FastSudoku, ParseError, Sudoku};
+    use crate::sudokus::{digit_mask, FastSudoku, NoRules, ParseError, Sudoku, ALL_DIGITS};
+
+    /// Removes all candidates of a cell except `digits`
+    fn only(board: &mut Board, row: usize, column: usize, digits: &[u8]) {
+        let keep = digits
+            .iter()
+            .fold(0, |mask, &digit| mask | digit_mask(digit));
+        board.eliminated[row][column] |= ALL_DIGITS & !keep;
+    }
+
+    #[test]
+    fn equal_pairs() {
+        let masks = [0b11, 0b111, 0b11, 0, 0b101, 0, 0b101, 0b11, 0b1];
+        let pairs: Vec<_> = super::equal_pairs(masks).collect();
+        assert_eq!(
+            pairs,
+            vec![(0, 2, 0b11), (0, 7, 0b11), (2, 7, 0b11), (4, 6, 0b101)]
+        );
+    }
+
+    #[test]
+    fn naked_pairs() {
+        let mut board = Board::EMPTY;
+        // 1 and 2 have to be in (0,0) and (0,1)
+        only(&mut board, 0, 0, &[1, 2]);
+        only(&mut board, 0, 1, &[1, 2]);
+
+        assert!(board.eliminate_naked_pairs(&NoRules));
+        let pair = digit_mask(1) | digit_mask(2);
+
+        // Removed from the rest of the row and the square
+        assert_eq!(board.candidates(&NoRules, 0, 8) & pair, 0);
+        assert_eq!(board.candidates(&NoRules, 2, 2) & pair, 0);
+        // The pair itself and other cells keep them
+        assert_eq!(board.candidates(&NoRules, 0, 0), pair);
+        assert_eq!(board.candidates(&NoRules, 3, 0) & pair, pair);
+        // 7 other cells in the row, 6 more in the square
+        assert_eq!(board.moves.pair_eliminations, 2 * (7 + 6));
+
+        // Nothing new the second time
+        assert!(!board.eliminate_naked_pairs(&NoRules));
+    }
+
+    #[test]
+    fn x_wings() {
+        let mut board = Board::EMPTY;
+        // In rows 1 and 5 the 7 is only possible in columns 2 and 6
+        for row in [1, 5] {
+            for column in [0, 1, 3, 4, 5, 7, 8] {
+                board.eliminated[row][column] |= digit_mask(7);
+            }
+        }
+
+        assert!(board.eliminate_x_wings(&NoRules));
+
+        // Removed from the other cells of columns 2 and 6
+        for row in [0, 2, 3, 4, 6, 7, 8] {
+            assert_eq!(board.candidates(&NoRules, row, 2) & digit_mask(7), 0);
+            assert_eq!(board.candidates(&NoRules, row, 6) & digit_mask(7), 0);
+        }
+        // The corners and other columns keep it
+        assert_ne!(board.candidates(&NoRules, 1, 2) & digit_mask(7), 0);
+        assert_ne!(board.candidates(&NoRules, 5, 6) & digit_mask(7), 0);
+        assert_ne!(board.candidates(&NoRules, 0, 0) & digit_mask(7), 0);
+        assert_eq!(board.moves.x_wing_eliminations, 2 * 7);
+
+        assert!(!board.eliminate_x_wings(&NoRules));
+    }
+
+    #[test]
+    fn x_wings_by_columns() {
+        let mut board = Board::EMPTY;
+        // In columns 0 and 8 the 3 is only possible in rows 4 and 7
+        for column in [0, 8] {
+            for row in [0, 1, 2, 3, 5, 6, 8] {
+                board.eliminated[row][column] |= digit_mask(3);
+            }
+        }
+
+        assert!(board.eliminate_x_wings(&NoRules));
+        assert_eq!(board.candidates(&NoRules, 4, 4) & digit_mask(3), 0);
+        assert_eq!(board.candidates(&NoRules, 7, 1) & digit_mask(3), 0);
+        assert_ne!(board.candidates(&NoRules, 4, 0) & digit_mask(3), 0);
+    }
+
+    #[test]
+    fn hard_without_guessing() {
+        // Needs "Naked pairs", but no guessing anymore
+        let mut sudoku =
+            Sudoku::from_file("test-sudokus/text/welt-23-11-11-hard-unsolved").unwrap();
+        assert!(sudoku.solve());
+        assert!(sudoku.moves().pair_eliminations > 0);
+        assert_eq!(sudoku.moves().bruteforce_moves, 0);
+    }
+
+    #[test]
+    fn clear_resets_eliminations() {
+        let mut sudoku =
+            Sudoku::from_file("test-sudokus/text/welt-23-11-11-hard-unsolved").unwrap();
+        let original = sudoku.clone();
+        sudoku.solve();
+
+        // Back to the start: all candidates have to be there again
+        for row in 0..9 {
+            for column in 0..9 {
+                if !original.is_set(row, column) {
+                    sudoku.clear(row, column);
+                }
+            }
+        }
+        for row in 0..9 {
+            for column in 0..9 {
+                assert_eq!(
+                    sudoku.candidates(row, column),
+                    original.candidates(row, column)
+                );
+            }
+        }
+    }
 
     #[test]
     fn units() {

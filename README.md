@@ -88,14 +88,21 @@ Both share the same code. See `src/sudokus/sudoku_rule.rs` for more details.
 
 
 ### Solving Strategies
-Currently 3 strategies are implemented:
+Currently 5 strategies are implemented:
 - Set missing (naked single): If only a single number is possible in a cell, it is set.
 
 - Set alone (hidden single): If a cell of row 1 is the only one where number 4 is possible, then this cell can be set to 4. The same works for columns and squares.
 
+- Naked pairs: If two cells of a row, column or square have the same two candidates (e.g. 3 and 7), these two digits have to be in these cells. So 3 and 7 can be removed from the candidates of all other cells of the unit.
+
+- X-Wing: If in two rows a digit is only possible in the same two columns, it has to be in the corners of this rectangle. So it can be removed from all other cells of these two columns. The same works with rows and columns swapped.
+
 - Bruteforce (backtracking): Take the empty cell with the fewest candidates and try them one after another. If one leads to a contradiction, the state before the guess is restored and the next candidate is tried.
 
-"Set missing" is used until it doesn't find anything, then "Set alone". Bruteforce is only used if both are stuck.
+"Set missing" is used until it doesn't find anything, then "Set alone", then "Naked pairs" and "X-Wing". Every success starts again with "Set missing". Bruteforce is only used if all of them are stuck.
+
+"Naked pairs" and "X-Wing" don't set cells, they only remove candidates. The removed candidates are stored per cell in the board (`eliminated`).
+They reduce the guessing (the hard sudoku from welt.de needs no guess anymore), but they are more expensive than a guess in the easy cases.
 Both strategies also detect contradictions (a cell without candidates, a digit without a cell), so a wrong guess is noticed early.
 
 See ToDo-Section for ideas to make it better and maybe faster.
@@ -107,7 +114,10 @@ This is an explorative project. I used it to learn about Rust and some of the fe
 ## ToDo
 - [x] Better Docs
 - [ ] More Sudokus for testing and benchmarking
-- [ ] More solving strategies for solving (e.g. naked pairs, pointing pairs, X-Wing)
+- [ ] More solving strategies for solving
+    - [x] Naked pairs
+    - [x] X-Wing
+    - [ ] Hidden pairs, pointing pairs, Swordfish
 - [x] ~~Multithreading~~ After a quick test, I don't think that it is worth it. The overhead is too much and the parallelism too short. It is better/cleaner/easier to just use `RUSTFLAGS="-C target-cpu=native"` for the speed up.
 - [ ] Support for other Sudoku variants
     - [x] X Sudoku
