@@ -1,3 +1,0 @@
-(function() {var implementors = {
-"lib":[["impl Freeze for <a class=\"struct\" href=\"lib/struct.Moves.html\" title=\"struct lib::Moves\">Moves</a>",1,["lib::Moves"]],["impl Freeze for <a class=\"struct\" href=\"lib/struct.Sudoku.html\" title=\"struct lib::Sudoku\">Sudoku</a>",1,["lib::Sudoku"]]]
-};if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()
