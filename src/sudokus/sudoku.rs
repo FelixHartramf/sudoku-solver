@@ -6,7 +6,7 @@ use std::str::FromStr;
 use super::parse::parse_grid;
 use super::{
     bits, digit_mask, has_duplicates, mask_digit, Field, Mask, Moves, ParseError, RuleSet,
-    SudokuRule, VariantRules, ALL_DIGITS,
+    Strategies, SudokuRule, VariantRules, ALL_DIGITS,
 };
 
 /// A sudoku with any combination of variants, e.g. loaded from a file.
@@ -283,15 +283,25 @@ impl Board {
 
     /// Uses the logical strategies until they don't find anything anymore.
     /// The cheap strategies are tried first, every success starts again at the top.
-    fn propagate<R: RuleSet>(&mut self, rules: &R) -> Result<(), Contradiction> {
+    fn propagate<R: RuleSet>(
+        &mut self,
+        rules: &R,
+        strategies: Strategies,
+    ) -> Result<(), Contradiction> {
         loop {
-            if self.set_missing_numbers(rules)? || self.set_alone_numbers(rules)? {
+            if strategies.set_missing && self.set_missing_numbers(rules)? {
+                continue;
+            }
+            if strategies.set_alone && self.set_alone_numbers(rules)? {
                 continue;
             }
             if self.unset == 0 {
                 return Ok(());
             }
-            if !self.eliminate_naked_pairs(rules) && !self.eliminate_x_wings(rules) {
+            if strategies.naked_pairs && self.eliminate_naked_pairs(rules) {
+                continue;
+            }
+            if !(strategies.x_wing && self.eliminate_x_wings(rules)) {
                 return Ok(());
             }
         }
@@ -324,8 +334,8 @@ impl Board {
     /// Solves the board with the strategies and guessing (backtracking).
     ///
     /// Returns true if it is solved. If not, the board is in an undefined state.
-    fn solve<R: RuleSet>(&mut self, rules: &R) -> bool {
-        if self.propagate(rules).is_err() {
+    fn solve<R: RuleSet>(&mut self, rules: &R, strategies: Strategies) -> bool {
+        if self.propagate(rules, strategies).is_err() {
             return false;
         }
         if self.unset == 0 {
@@ -338,7 +348,7 @@ impl Board {
             self.place(row, column, digit);
             self.moves.bruteforce_moves += 1;
 
-            if self.solve(rules) {
+            if self.solve(rules, strategies) {
                 return true;
             }
 
@@ -350,8 +360,13 @@ impl Board {
     }
 
     /// Counts the solutions, but stops at `limit`
-    fn count_solutions<R: RuleSet>(&mut self, rules: &R, limit: usize) -> usize {
-        if self.propagate(rules).is_err() {
+    fn count_solutions<R: RuleSet>(
+        &mut self,
+        rules: &R,
+        strategies: Strategies,
+        limit: usize,
+    ) -> usize {
+        if self.propagate(rules, strategies).is_err() {
             return 0;
         }
         if self.unset == 0 {
@@ -366,7 +381,7 @@ impl Board {
                 break;
             }
             self.place(row, column, digit);
-            found += self.count_solutions(rules, limit - found);
+            found += self.count_solutions(rules, strategies, limit - found);
             *self = before_guess;
         }
         found
@@ -381,6 +396,7 @@ impl Board {
 pub struct GenericSudoku<R: RuleSet> {
     board: Board,
     rules: R,
+    strategies: Strategies,
 }
 
 impl<R: RuleSet> Default for GenericSudoku<R> {
@@ -388,6 +404,7 @@ impl<R: RuleSet> Default for GenericSudoku<R> {
         Self {
             board: Board::EMPTY,
             rules: R::default(),
+            strategies: Strategies::default(),
         }
     }
 }
@@ -532,6 +549,17 @@ impl<R: RuleSet> GenericSudoku<R> {
         &self.rules
     }
 
+    /// Returns the strategies used by [`solve`](Self::solve) and [`count_solutions`](Self::count_solutions)
+    pub fn strategies(&self) -> Strategies {
+        self.strategies
+    }
+
+    /// Chooses the strategies used by [`solve`](Self::solve) and
+    /// [`count_solutions`](Self::count_solutions). The default is [`Strategies::FASTEST`].
+    pub fn set_strategies(&mut self, strategies: Strategies) {
+        self.strategies = strategies;
+    }
+
     /// Returns the cells, indexed as `field[row][column]`
     pub fn field(&self) -> &Field {
         &self.board.field
@@ -674,7 +702,7 @@ impl<R: RuleSet> GenericSudoku<R> {
         }
 
         let mut board = self.board;
-        if !board.solve(&self.rules) {
+        if !board.solve(&self.rules, self.strategies) {
             return false;
         }
         self.board = board;
@@ -692,7 +720,9 @@ impl<R: RuleSet> GenericSudoku<R> {
         if limit == 0 || !self.is_part_correct() {
             return 0;
         }
-        self.board.clone().count_solutions(&self.rules, limit)
+        self.board
+            .clone()
+            .count_solutions(&self.rules, self.strategies, limit)
     }
 
     /// Returns true if the sudoku has exactly one solution, as a proper sudoku should
@@ -705,7 +735,9 @@ impl<R: RuleSet> GenericSudoku<R> {
 mod sudoku_test {
     use super::{Board, UNITS};
     use crate::sample_files;
-    use crate::sudokus::{digit_mask, FastSudoku, NoRules, ParseError, Sudoku, ALL_DIGITS};
+    use crate::sudokus::{
+        digit_mask, FastSudoku, NoRules, ParseError, Strategies, Sudoku, ALL_DIGITS,
+    };
 
     /// Removes all candidates of a cell except `digits`
     fn only(board: &mut Board, row: usize, column: usize, digits: &[u8]) {
@@ -795,6 +827,7 @@ mod sudoku_test {
         // Needs "Naked pairs", but no guessing anymore
         let mut sudoku =
             Sudoku::from_file("test-sudokus/text/welt-23-11-11-hard-unsolved").unwrap();
+        sudoku.set_strategies(Strategies::ALL);
         assert!(sudoku.solve());
         assert!(sudoku.moves().pair_eliminations > 0);
         assert_eq!(sudoku.moves().bruteforce_moves, 0);
@@ -960,7 +993,10 @@ mod sudoku_test {
         // Medium can be solved with "Set missing" and "Set alone"
         let mut sudoku =
             Sudoku::from_file("test-sudokus/text/welt-23-11-11-medium-unsolved").unwrap();
-        assert!(sudoku.board.propagate(&sudoku.rules).is_ok());
+        assert!(sudoku
+            .board
+            .propagate(&sudoku.rules, Strategies::ALL)
+            .is_ok());
         assert!(sudoku.is_correct());
 
         // Hard can't, but every step has to be correct
@@ -983,12 +1019,19 @@ mod sudoku_test {
 
     #[test]
     fn count_moves() {
-        for path in sample_files::unsolved() {
-            let mut sudoku = Sudoku::from_file(path).unwrap();
-            let unset = sudoku.count_unset();
+        for strategies in Strategies::all_combinations() {
+            for path in sample_files::unsolved() {
+                let mut sudoku = Sudoku::from_file(path).unwrap();
+                let unset = sudoku.count_unset();
+                // Pure guessing is too slow for the hard ones, see tests/tests.rs
+                if !strategies.set_missing && !strategies.set_alone && unset > 50 {
+                    continue;
+                }
+                sudoku.set_strategies(strategies);
 
-            assert!(sudoku.solve());
-            assert_eq!(unset, sudoku.count_moves(), "{path}");
+                assert!(sudoku.solve());
+                assert_eq!(unset, sudoku.count_moves(), "{path} {strategies}");
+            }
         }
 
         // Player moves count too

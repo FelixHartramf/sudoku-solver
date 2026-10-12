@@ -1,7 +1,7 @@
 # Sudoku Solver
 
 ## What it does
-It solves Sudokus fast. All sudokus I use for testing are solved in less than 10µs each on my machine (`cargo bench`).
+It solves Sudokus fast. Most sudokus I use for testing are solved in less than 10µs on my machine, the hardest one ("World's hardest sudoku" by Arto Inkala) in about 0.5ms (`cargo bench`).
 
 
 ## Features
@@ -9,13 +9,16 @@ It solves Sudokus fast. All sudokus I use for testing are solved in less than 10
 - Sudoku variants: X-Sudoku and Even-Odd-Sudoku
 - checks if a sudoku has a unique solution
 - counts which strategy set how many cells
+- the solving strategies can be chosen
 
 
 ## Usage 
 To solve a Sudoku run:
 ```
-./sudoku <file>
+./sudoku [--strategies <list>] <file>
 ```
+
+`--strategies` chooses the solving strategies as comma separated list of `missing`, `alone`, `pairs`, `x-wing`, `all` and `none` (see [Solving Strategies](#solving-strategies)). The default is `missing,alone`.
 
 The exit code is `0` if the sudoku was solved, `1` if it has no solution and `2` if the file could not be read.
 
@@ -41,10 +44,11 @@ even-odd-sudoku:
 
 ### Library
 ```rust
-use sudoku::sudokus::Sudoku;
+use sudoku::sudokus::{Strategies, Sudoku};
 
 let mut sudoku = Sudoku::from_file("test-sudokus/text/welt-23-11-11-hard-unsolved")?;
 assert!(sudoku.has_unique_solution());
+sudoku.set_strategies(Strategies::ALL); // optional, the default is Strategies::FASTEST
 sudoku.solve();
 println!("{sudoku}");
 ```
@@ -101,9 +105,32 @@ Currently 5 strategies are implemented:
 
 "Set missing" is used until it doesn't find anything, then "Set alone", then "Naked pairs" and "X-Wing". Every success starts again with "Set missing". Bruteforce is only used if all of them are stuck.
 
+"Set missing" and "Set alone" also detect contradictions (a cell without candidates, a digit without a cell), so a wrong guess is noticed early.
+
 "Naked pairs" and "X-Wing" don't set cells, they only remove candidates. The removed candidates are stored per cell in the board (`eliminated`).
-They reduce the guessing (the hard sudoku from welt.de needs no guess anymore), but they are more expensive than a guess in the easy cases.
-Both strategies also detect contradictions (a cell without candidates, a digit without a cell), so a wrong guess is noticed early.
+
+#### Choosing the strategies
+Bruteforce is always used, so every combination of the other 4 strategies solves every sudoku. They only change the speed. The tests check all 16 combinations.
+
+The `Strategies` group of `cargo bench` compares them on all test sudokus (time for all 13 together):
+
+| Strategies | Time |
+|---|---|
+| missing, alone | 665 – 700 µs |
+| missing, alone, pairs | 660 – 700 µs |
+| missing, alone, pairs, x-wing | 774 µs |
+| missing, alone, x-wing | 865 µs |
+| alone | 999 µs |
+| alone, pairs | 1297 µs |
+| alone, x-wing | 1388 µs |
+| alone, pairs, x-wing | 1476 µs |
+| missing | 1752 µs |
+| missing, pairs | 2380 µs |
+| missing, pairs, x-wing | 3021 µs |
+| missing, x-wing | 5145 µs |
+| pairs / x-wing / pairs, x-wing / none | 0.4 – 8 s (nearly pure guessing) |
+
+`missing,alone` and `missing,alone,pairs` are equal within the noise of several runs. The sum is dominated by the hardest sudoku, where "Naked pairs" helps (497µs → 385µs). On the other sudokus it is slower or the same (e.g. AI Escargot 19µs → 60µs, the 17-clue sudoku 5µs → 9µs), because a guess is cheaper than searching for pairs. So the default (`Strategies::FASTEST`) is `missing,alone`.
 
 See ToDo-Section for ideas to make it better and maybe faster.
 
@@ -113,7 +140,7 @@ This is an explorative project. I used it to learn about Rust and some of the fe
 
 ## ToDo
 - [x] Better Docs
-- [ ] More Sudokus for testing and benchmarking
+- [ ] More Sudokus for testing and benchmarking (the choice of the default strategies depends on them)
 - [ ] More solving strategies for solving
     - [x] Naked pairs
     - [x] X-Wing

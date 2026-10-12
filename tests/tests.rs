@@ -1,5 +1,5 @@
 use sudoku::sample_files;
-use sudoku::sudokus::{FastSudoku, Sudoku};
+use sudoku::sudokus::{FastSudoku, Strategies, Sudoku};
 
 #[test]
 fn solve() {
@@ -57,4 +57,37 @@ fn variant_needs_its_rule() {
     assert!(classic.rules().is_empty());
     assert_eq!(classic.count_solutions(100), 45);
     assert_eq!(Sudoku::from_file(path).unwrap().count_solutions(100), 1);
+}
+
+#[test]
+fn every_strategy_combination() {
+    // Guessing is always used, so every combination has to find the solution
+    for strategies in Strategies::all_combinations() {
+        // Without "Set missing" and "Set alone" it is nearly pure guessing,
+        // which takes seconds for the hard ones. So only the easy ones are used.
+        let only_guessing = !strategies.set_missing && !strategies.set_alone;
+
+        for (unsolved, solved) in sample_files::WITH_SOLUTION {
+            let mut sudoku = Sudoku::from_file(unsolved).unwrap();
+            if only_guessing && sudoku.count_unset() > 50 {
+                continue;
+            }
+            sudoku.set_strategies(strategies);
+
+            assert!(sudoku.has_unique_solution(), "{unsolved} {strategies}");
+            assert!(sudoku.solve(), "{unsolved} {strategies}");
+            assert_eq!(
+                sudoku,
+                Sudoku::from_file(solved).unwrap(),
+                "{unsolved} {strategies}"
+            );
+        }
+
+        if !only_guessing {
+            let mut fast_sudoku = FastSudoku::from_file(sample_files::CLASSIC_UNSOLVED[7]).unwrap();
+            fast_sudoku.set_strategies(strategies);
+            assert!(fast_sudoku.solve());
+            assert!(fast_sudoku.is_correct());
+        }
+    }
 }

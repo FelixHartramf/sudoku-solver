@@ -3,7 +3,7 @@
 //! The file names have the format `{website}-{date of retrieval}-{level}-{solved/unsolved}`.
 
 /// Classic sudokus without a solution file
-pub const CLASSIC_UNSOLVED: [&str; 7] = [
+pub const CLASSIC_UNSOLVED: [&str; 9] = [
     "test-sudokus/text/tagesspiegel-23-11-11-easy-unsolved",
     "test-sudokus/text/welt-23-11-11-easy-unsolved",
     "test-sudokus/text/welt-23-11-11-medium-unsolved",
@@ -11,6 +11,8 @@ pub const CLASSIC_UNSOLVED: [&str; 7] = [
     "test-sudokus/text/sudoku-com-12-11-12-master-unsolved",
     "test-sudokus/text/sudoku-com-12-11-12-2-master-unsolved",
     "test-sudokus/text/wikipedia-17-given-unsolved",
+    "test-sudokus/text/inkala-26-10-12-hardest-unsolved",
+    "test-sudokus/text/inkala-26-10-12-ai-escargot-unsolved",
 ];
 
 /// Sudokus with variant rules
@@ -22,7 +24,7 @@ pub const VARIANT_UNSOLVED: [&str; 4] = [
 ];
 
 /// Pairs of `(unsolved, solved)`
-pub const WITH_SOLUTION: [(&str, &str); 8] = [
+pub const WITH_SOLUTION: [(&str, &str); 10] = [
     // Classic
     (
         "test-sudokus/text/sudoku-com-12-11-12-master-unsolved",
@@ -39,6 +41,14 @@ pub const WITH_SOLUTION: [(&str, &str); 8] = [
     (
         "test-sudokus/text/tagesspiegel-23-11-11-easy-unsolved",
         "test-sudokus/text/tagesspiegel-23-11-11-easy-solved",
+    ),
+    (
+        "test-sudokus/text/inkala-26-10-12-hardest-unsolved",
+        "test-sudokus/text/inkala-26-10-12-hardest-solved",
+    ),
+    (
+        "test-sudokus/text/inkala-26-10-12-ai-escargot-unsolved",
+        "test-sudokus/text/inkala-26-10-12-ai-escargot-solved",
     ),
     // X-Sudoku
     (
