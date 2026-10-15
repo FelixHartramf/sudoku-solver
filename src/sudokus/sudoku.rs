@@ -1,1031 +1,1080 @@
 use std::fmt;
 use std::fs;
-use std::fmt::Debug;
-use crate::sudokus::SudokuRule;
+use std::path::Path;
+use std::str::FromStr;
 
-use super::even_odd_sudoku::EvenOddSudoku;
-use super::x_sudoku::XSudoku;
+use super::parse::parse_grid;
+use super::{
+    bits, digit_mask, has_duplicates, mask_digit, Field, Mask, Moves, ParseError, RuleSet,
+    Strategies, SudokuRule, VariantRules, ALL_DIGITS,
+};
 
-#[derive(Debug, Clone)]
-pub struct Moves {
-    missing_moves: u32,
-    alone_moves: u32,
-    player_moves: u32,
-    bruteforce_moves: u32,
-    bruteforce_failed_tries: u32,
-    failed_missing_moves: u32,
-    failed_alone_moves: u32,
-}
+/// A sudoku with any combination of variants, e.g. loaded from a file.
+///
+/// ```
+/// use sudoku::sudokus::Sudoku;
+///
+/// let mut sudoku = Sudoku::from_file("test-sudokus/text/sudoku-com-24-01-06-x-sudoku-master-unsolved").unwrap();
+/// assert!(sudoku.solve());
+/// assert!(sudoku.is_correct());
+/// ```
+pub type Sudoku = GenericSudoku<VariantRules>;
 
-impl Moves {
-    pub fn empty() -> Self {
-        Self {
-            missing_moves: 0,
-            alone_moves: 0,
-            bruteforce_moves: 0,
-            bruteforce_failed_tries: 0,
-            player_moves: 0,
-            failed_alone_moves: 0,
-            failed_missing_moves: 0,
+/// The 27 units (9 rows, 9 columns, 9 squares) as lists of `(row, column)`
+const UNITS: [[(usize, usize); 9]; 27] = build_units();
+
+const fn build_units() -> [[(usize, usize); 9]; 27] {
+    let mut units = [[(0, 0); 9]; 27];
+    let mut i = 0;
+    while i < 9 {
+        let mut j = 0;
+        while j < 9 {
+            units[i][j] = (i, j);
+            units[9 + i][j] = (j, i);
+            units[18 + i][j] = (i / 3 * 3 + j / 3, i % 3 * 3 + j % 3);
+            j += 1;
         }
+        i += 1;
     }
+    units
 }
 
-/// Sudoku. It contains the data of the field and counts the moves
-pub struct Sudoku {
-    pub field: [[i32; 9]; 9],
+#[inline]
+const fn square_index(row: usize, column: usize) -> usize {
+    row / 3 * 3 + column / 3
+}
+
+/// Returns `(first, second, mask)` for every two masks that are equal and have exactly two bits
+fn equal_pairs(masks: [Mask; 9]) -> impl Iterator<Item = (usize, usize, Mask)> {
+    (0..9)
+        .filter(move |&first| masks[first].count_ones() == 2)
+        .flat_map(move |first| {
+            (first + 1..9)
+                .filter(move |&second| masks[second] == masks[first])
+                .map(move |second| (first, second, masks[first]))
+        })
+}
+
+/// The board found a cell or unit that can't be filled anymore
+struct Contradiction;
+
+/// The state of the field.
+///
+/// Besides the cells it stores the digits used in every row, column and
+/// square, so the candidates of a cell are just three ORs away.
+/// It is `Copy`, so saving the state before a guess is a cheap memcpy.
+#[derive(Debug, Clone, Copy)]
+struct Board {
+    field: Field,
+    rows: [Mask; 9],
+    columns: [Mask; 9],
+    squares: [Mask; 9],
+    /// Candidates removed by "Naked pairs" and "X-Wing"
+    eliminated: Field,
+    unset: u8,
     moves: Moves,
-
-    rules: Vec<Box<dyn SudokuRule>>,
 }
 
-impl PartialEq for Sudoku {
+impl Board {
+    const EMPTY: Board = Board {
+        field: [[0; 9]; 9],
+        rows: [0; 9],
+        columns: [0; 9],
+        squares: [0; 9],
+        eliminated: [[0; 9]; 9],
+        unset: 81,
+        moves: Moves::NONE,
+    };
+
+    /// Sets an empty cell
+    #[inline]
+    fn place(&mut self, row: usize, column: usize, mask: Mask) {
+        debug_assert!(self.field[row][column] == 0 && mask.count_ones() == 1);
+        self.field[row][column] = mask;
+        self.rows[row] |= mask;
+        self.columns[column] |= mask;
+        self.squares[square_index(row, column)] |= mask;
+        self.unset -= 1;
+    }
+
+    /// Empties a cell
+    fn clear(&mut self, row: usize, column: usize) {
+        if self.field[row][column] == 0 {
+            return;
+        }
+        self.field[row][column] = 0;
+        self.unset += 1;
+        // The eliminations might depend on the cleared cell
+        self.eliminated = [[0; 9]; 9];
+        // Recalculate, as the digit could be in a unit twice when a player made a mistake
+        self.rows[row] = self.field[row].iter().fold(0, |set, cell| set | cell);
+        self.columns[column] = (0..9).fold(0, |set, r| set | self.field[r][column]);
+        let square = square_index(row, column);
+        self.squares[square] = UNITS[18 + square]
+            .iter()
+            .fold(0, |set, &(r, c)| set | self.field[r][c]);
+    }
+
+    /// Returns the digits that can be set in an empty cell
+    #[inline]
+    fn candidates<R: RuleSet>(&self, rules: &R, row: usize, column: usize) -> Mask {
+        let used = self.rows[row]
+            | self.columns[column]
+            | self.squares[square_index(row, column)]
+            | self.eliminated[row][column]
+            | rules.excluded(&self.field, row, column);
+        ALL_DIGITS & !used
+    }
+
+    /// "Set missing": Sets every cell with only a single candidate.
+    ///
+    /// Returns true if a cell was set.
+    fn set_missing_numbers<R: RuleSet>(&mut self, rules: &R) -> Result<bool, Contradiction> {
+        let mut progress = false;
+        for row in 0..9 {
+            for column in 0..9 {
+                if self.field[row][column] != 0 {
+                    continue;
+                }
+                let candidates = self.candidates(rules, row, column);
+                match candidates.count_ones() {
+                    0 => return Err(Contradiction),
+                    1 => {
+                        self.place(row, column, candidates);
+                        self.moves.missing_moves += 1;
+                        progress = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(progress)
+    }
+
+    /// "Set alone": Sets every digit that is only possible in a single cell
+    /// of a row, column or square.
+    ///
+    /// Returns true if a cell was set.
+    fn set_alone_numbers<R: RuleSet>(&mut self, rules: &R) -> Result<bool, Contradiction> {
+        let mut progress = false;
+        for unit in &UNITS {
+            let mut used = 0;
+            let mut once = 0;
+            let mut twice = 0;
+            let mut candidates = [0; 9];
+
+            for (i, &(row, column)) in unit.iter().enumerate() {
+                if self.field[row][column] != 0 {
+                    used |= self.field[row][column];
+                    continue;
+                }
+                candidates[i] = self.candidates(rules, row, column);
+                twice |= once & candidates[i];
+                once |= candidates[i];
+            }
+
+            // A digit that is neither set nor possible anywhere in the unit
+            if used | once != ALL_DIGITS {
+                return Err(Contradiction);
+            }
+
+            for digit in bits(once & !twice) {
+                let i = candidates.iter().position(|c| c & digit != 0).unwrap_or(9);
+                let (row, column) = unit[i];
+                // Two digits that can only go into the same cell
+                if self.field[row][column] != 0 || self.candidates(rules, row, column) & digit == 0
+                {
+                    return Err(Contradiction);
+                }
+                self.place(row, column, digit);
+                self.moves.alone_moves += 1;
+                progress = true;
+            }
+        }
+        Ok(progress)
+    }
+
+    /// Uses the logical strategies until they don't find anything anymore
+    /// Removes `digits` from the candidates of an empty cell.
+    ///
+    /// Returns the number of candidates that were removed.
+    #[inline]
+    fn eliminate<R: RuleSet>(&mut self, rules: &R, row: usize, column: usize, digits: Mask) -> u32 {
+        if self.field[row][column] != 0 {
+            return 0;
+        }
+        let removed = self.candidates(rules, row, column) & digits;
+        self.eliminated[row][column] |= removed;
+        removed.count_ones()
+    }
+
+    /// "Naked pairs": If two cells of a row, column or square have the same
+    /// two candidates, these digits have to be in these two cells. So they
+    /// can be removed from all other cells of the unit.
+    ///
+    /// Returns true if a candidate was removed.
+    fn eliminate_naked_pairs<R: RuleSet>(&mut self, rules: &R) -> bool {
+        let mut removed = 0;
+        for unit in &UNITS {
+            let candidates = unit.map(|(row, column)| match self.field[row][column] {
+                0 => self.candidates(rules, row, column),
+                _ => 0,
+            });
+
+            for (first, second, pair) in equal_pairs(candidates) {
+                for (i, &(row, column)) in unit.iter().enumerate() {
+                    if i != first && i != second {
+                        removed += self.eliminate(rules, row, column, pair);
+                    }
+                }
+            }
+        }
+        self.moves.pair_eliminations += removed;
+        removed > 0
+    }
+
+    /// "X-Wing": If a digit is only possible in the same two columns of two
+    /// rows, it has to be in the corners of this rectangle. So it can be
+    /// removed from all other cells of the two columns.
+    /// The same works with rows and columns swapped.
+    ///
+    /// Returns true if a candidate was removed.
+    fn eliminate_x_wings<R: RuleSet>(&mut self, rules: &R) -> bool {
+        let mut removed = 0;
+        for by_rows in [true, false] {
+            // A line is a row (or column), a cross line a column (or row)
+            let cell = |line: usize, cross: usize| {
+                if by_rows {
+                    (line, cross)
+                } else {
+                    (cross, line)
+                }
+            };
+
+            // positions[line][digit]: the cross lines where the digit is possible
+            let mut positions = [[0 as Mask; 9]; 9];
+            for (line, digit_positions) in positions.iter_mut().enumerate() {
+                for cross in 0..9 {
+                    let (row, column) = cell(line, cross);
+                    if self.field[row][column] != 0 {
+                        continue;
+                    }
+                    for digit in bits(self.candidates(rules, row, column)) {
+                        digit_positions[digit.trailing_zeros() as usize] |= 1 << cross;
+                    }
+                }
+            }
+
+            for digit in 0..9 {
+                let lines = positions.map(|digit_positions| digit_positions[digit]);
+                for (first, second, crosses) in equal_pairs(lines) {
+                    for cross in bits(crosses).map(|bit| bit.trailing_zeros() as usize) {
+                        for line in (0..9).filter(|&line| line != first && line != second) {
+                            let (row, column) = cell(line, cross);
+                            removed += self.eliminate(rules, row, column, 1 << digit);
+                        }
+                    }
+                }
+            }
+        }
+        self.moves.x_wing_eliminations += removed;
+        removed > 0
+    }
+
+    /// Uses the logical strategies until they don't find anything anymore.
+    /// The cheap strategies are tried first, every success starts again at the top.
+    fn propagate<R: RuleSet>(
+        &mut self,
+        rules: &R,
+        strategies: Strategies,
+    ) -> Result<(), Contradiction> {
+        loop {
+            if strategies.set_missing && self.set_missing_numbers(rules)? {
+                continue;
+            }
+            if strategies.set_alone && self.set_alone_numbers(rules)? {
+                continue;
+            }
+            if self.unset == 0 {
+                return Ok(());
+            }
+            if strategies.naked_pairs && self.eliminate_naked_pairs(rules) {
+                continue;
+            }
+            if !(strategies.x_wing && self.eliminate_x_wings(rules)) {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Returns the empty cell with the fewest candidates.
+    /// Guessing there needs the fewest tries.
+    fn most_constrained_cell<R: RuleSet>(&self, rules: &R) -> (usize, usize, Mask) {
+        let mut best = (9, 9, ALL_DIGITS);
+        let mut best_count = u32::MAX;
+        for row in 0..9 {
+            for column in 0..9 {
+                if self.field[row][column] != 0 {
+                    continue;
+                }
+                let candidates = self.candidates(rules, row, column);
+                let count = candidates.count_ones();
+                if count < best_count {
+                    best = (row, column, candidates);
+                    best_count = count;
+                    if count <= 2 {
+                        return best;
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// Solves the board with the strategies and guessing (backtracking).
+    ///
+    /// Returns true if it is solved. If not, the board is in an undefined state.
+    fn solve<R: RuleSet>(&mut self, rules: &R, strategies: Strategies) -> bool {
+        if self.propagate(rules, strategies).is_err() {
+            return false;
+        }
+        if self.unset == 0 {
+            return true;
+        }
+
+        let (row, column, candidates) = self.most_constrained_cell(rules);
+        let before_guess = *self;
+        for digit in bits(candidates) {
+            self.place(row, column, digit);
+            self.moves.bruteforce_moves += 1;
+
+            if self.solve(rules, strategies) {
+                return true;
+            }
+
+            let moves = before_guess.moves.rolled_back(&self.moves);
+            *self = before_guess;
+            self.moves = moves;
+        }
+        false
+    }
+
+    /// Counts the solutions, but stops at `limit`
+    fn count_solutions<R: RuleSet>(
+        &mut self,
+        rules: &R,
+        strategies: Strategies,
+        limit: usize,
+    ) -> usize {
+        if self.propagate(rules, strategies).is_err() {
+            return 0;
+        }
+        if self.unset == 0 {
+            return 1;
+        }
+
+        let (row, column, candidates) = self.most_constrained_cell(rules);
+        let before_guess = *self;
+        let mut found = 0;
+        for digit in bits(candidates) {
+            if found >= limit {
+                break;
+            }
+            self.place(row, column, digit);
+            found += self.count_solutions(rules, strategies, limit - found);
+            *self = before_guess;
+        }
+        found
+    }
+}
+
+/// A sudoku that is solved with the rules `R`.
+///
+/// Use the aliases [`Sudoku`] (variants chosen at runtime) or
+/// [`FastSudoku`](super::FastSudoku) (only classic rules).
+#[derive(Debug, Clone)]
+pub struct GenericSudoku<R: RuleSet> {
+    board: Board,
+    rules: R,
+    strategies: Strategies,
+}
+
+impl<R: RuleSet> Default for GenericSudoku<R> {
+    fn default() -> Self {
+        Self {
+            board: Board::EMPTY,
+            rules: R::default(),
+            strategies: Strategies::default(),
+        }
+    }
+}
+
+impl<R: RuleSet> PartialEq for GenericSudoku<R> {
     fn eq(&self, other: &Self) -> bool {
-        self.field == other.field
+        self.board.field == other.board.field
     }
 }
 
-impl fmt::Display for Sudoku {
+impl<R: RuleSet> fmt::Display for GenericSudoku<R> {
+    /// Prints the field in the same format as the files, `0` is an empty cell
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        for collum in 0..9 {
-            for row in 0..9 {
-                write!(f, "{} ", self.get_number(row, collum))?;
-                if row % 3 == 2 {
+        for row in 0..9 {
+            for column in 0..9 {
+                write!(f, "{} ", self.get_number(row, column).unwrap_or(0))?;
+                if column % 3 == 2 && column != 8 {
                     write!(f, " ")?;
                 }
             }
-            write!(f, "\n")?;
-            if collum % 3 == 2 {
-                write!(f, "\n")?;
+            writeln!(f)?;
+            if row % 3 == 2 && row != 8 {
+                writeln!(f)?;
             }
         }
-
-        write!(f, "Moves: {:#?} ", self.moves)?;
         Ok(())
     }
 }
 
-impl fmt::Debug for Sudoku {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        for collum in 0..9 {
-            for row in 0..9 {
-                write!(f, "{} ", self.get_number(row, collum))?;
-                if row % 3 == 2 {
-                    write!(f, " ")?;
-                }
+impl<R: RuleSet> FromStr for GenericSudoku<R> {
+    type Err = ParseError;
+
+    /// Reads a sudoku. For the format see the files in `test-sudokus/text/`:
+    ///
+    /// The file consists of sections that end with `;`. Each section starts
+    /// with its name, followed by `:` and its content. The `field` section
+    /// contains the 81 cells in reading order, `0` is an empty cell.
+    /// All other sections add the rules of a variant.
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let mut sudoku = Self::default();
+        let mut has_field = false;
+
+        for section in input.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            let (name, body) = section.split_once(':').unwrap_or((section, ""));
+            let name = name.trim();
+
+            if name != "field" {
+                sudoku.rules.add_section(name, body)?;
+                continue;
             }
-            write!(f, "\n")?;
-            if collum % 3 == 2 {
-                write!(f, "\n")?;
+
+            if has_field {
+                return Err(ParseError::DuplicateSection(name.to_string()));
+            }
+            has_field = true;
+
+            let digits = parse_grid(name, body, |c| match c {
+                '.' => Some(0),
+                _ => c.to_digit(10).map(|digit| digit as u8),
+            })?;
+            for (row, digits) in digits.iter().enumerate() {
+                for (column, &digit) in digits.iter().enumerate() {
+                    if digit != 0 {
+                        sudoku.board.place(row, column, digit_mask(digit));
+                    }
+                }
             }
         }
 
-        write!(f, "Moves: {:#?} ", self.moves)?;
-        Ok(())
+        if !has_field {
+            return Err(ParseError::MissingField);
+        }
+        Ok(sudoku)
     }
 }
 
 impl Sudoku {
-    /// Relative Path of solveable Sudokus.
-    /// The following format is used:
-    /// {website}-{date of retival}-{level}-{solved/unsolved}
+    /// Adds a variant rule
+    /// ```
+    /// use sudoku::sudokus::{Sudoku, XSudoku};
     ///
-    /// For data structure see Sudoku::from_file
-    pub const UNSOLVED_SUDOKU_FILES: [&'static str; 12] = [
-        "test-sudokus/text/tagesspiegel-23-11-11-easy-unsolved",
-        "test-sudokus/text/welt-23-11-11-medium-unsolved",
-        "test-sudokus/text/welt-23-11-11-hard-unsolved",
-        "test-sudokus/text/welt-23-11-11-easy-unsolved",
-        "test-sudokus/text/tagesspiegel-23-11-11-easy-unsolved",
-        "test-sudokus/text/sudoku-com-12-11-12-master-unsolved",
-        "test-sudokus/text/sudoku-com-12-11-12-2-master-unsolved",
-        "test-sudokus/text/wikipedia-17-given-unsolved",
-        "test-sudokus/text/sudoku-com-24-01-06-x-sudoku-easy-unsolved",
-        "test-sudokus/text/sudoku-com-24-01-06-x-sudoku-master-unsolved",
-        "test-sudokus/text/sudokuzok-de-24-01-07-evenodd-easy-unsolved",
-        "test-sudokus/text/sudokuzok-de-24-01-07-evenodd-extra-hard-unsolved"
-    ];
+    /// let mut sudoku = Sudoku::empty();
+    /// sudoku.add_rule(XSudoku);
+    /// assert!(sudoku.solve());
+    /// ```
+    pub fn add_rule(&mut self, rule: impl SudokuRule + 'static) {
+        self.rules.push(rule);
+    }
+}
 
-    pub const SUDOKUS_WITH_SOLUTION: [[&'static str; 2]; 8] = [
-        // Normal
-        ["test-sudokus/text/sudoku-com-12-11-12-master-unsolved", "test-sudokus/text/sudoku-com-12-11-12-master-solved"],
-        ["test-sudokus/text/welt-23-11-11-medium-unsolved", "test-sudokus/text/welt-23-11-11-medium-solved"],
-        ["test-sudokus/text/welt-23-11-11-easy-unsolved", "test-sudokus/text/welt-23-11-11-easy-solved"],
-        ["test-sudokus/text/tagesspiegel-23-11-11-easy-unsolved", "test-sudokus/text/tagesspiegel-23-11-11-easy-solved"],
-
-        // X-Sudoku
-        ["test-sudokus/text/sudoku-com-24-01-06-x-sudoku-easy-unsolved", "test-sudokus/text/sudoku-com-24-01-06-x-sudoku-easy-solved"],
-        ["test-sudokus/text/sudoku-com-24-01-06-x-sudoku-master-unsolved", "test-sudokus/text/sudoku-com-24-01-06-x-sudoku-master-solved"],
-
-        // Even-Odd-Sudoku
-        ["test-sudokus/text/sudokuzok-de-24-01-07-evenodd-easy-unsolved", "test-sudokus/text/sudokuzok-de-24-01-07-evenodd-easy-solved"],
-        ["test-sudokus/text/sudokuzok-de-24-01-07-evenodd-extra-hard-unsolved", "test-sudokus/text/sudokuzok-de-24-01-07-evenodd-extra-hard-solved"]
-    ];
-
+impl<R: RuleSet> GenericSudoku<R> {
     /// Returns an empty Sudoku
     /// ```
     /// use sudoku::sudokus::Sudoku;
     ///
     /// let sudoku = Sudoku::empty();
+    /// assert_eq!(sudoku.count_unset(), 81);
     /// ```
     pub fn empty() -> Self {
-        Self {
-            field: [[0; 9]; 9],
-            moves: Moves::empty(),
-            rules: vec![],
-        }
+        Self::default()
     }
 
-    /// Returns an solved Sudoku
+    /// Returns a solved Sudoku
     /// ```
     /// use sudoku::sudokus::Sudoku;
     ///
     /// let sudoku = Sudoku::example_solved();
+    /// assert!(sudoku.is_correct());
     /// ```
     pub fn example_solved() -> Self {
-        let mut sudoku = Sudoku::empty();
-        let numbers: [i32; 81] = [
-            6, 3, 5, 4, 9, 2, 1, 8, 7, 1, 7, 4, 3, 5, 8, 2, 9, 6, 2, 8, 9, 1, 7, 6, 5, 4, 3, 5, 1,
-            8, 9, 3, 7, 4, 6, 2, 7, 2, 6, 8, 4, 5, 9, 3, 1, 4, 9, 3, 6, 2, 1, 8, 7, 5, 3, 5, 1, 7,
-            8, 9, 6, 2, 4, 9, 6, 7, 2, 1, 4, 3, 5, 8, 8, 4, 2, 5, 6, 3, 7, 1, 9,
-        ];
-        let mut count = 0;
-        for num in numbers {
-            sudoku.add_number(count % 9, count / 9, num);
+        "field:
+            6 3 5  4 9 2  1 8 7
+            1 7 4  3 5 8  2 9 6
+            2 8 9  1 7 6  5 4 3
 
-            count += 1;
-        }
+            5 1 8  9 3 7  4 6 2
+            7 2 6  8 4 5  9 3 1
+            4 9 3  6 2 1  8 7 5
 
-        return sudoku;
+            3 5 1  7 8 9  6 2 4
+            9 6 7  2 1 4  3 5 8
+            8 4 2  5 6 3  7 1 9;"
+            .parse()
+            .expect("the example is valid")
     }
 
-    /// Returns an Sudoku from File
+    /// Reads a Sudoku from a file, see the `FromStr` implementation for the format
     /// ```
     /// use sudoku::sudokus::Sudoku;
     ///
-    /// let sudoku = Sudoku::from_file("test-sudokus/text/sudoku-com-12-11-12-master-solved");
+    /// let sudoku = Sudoku::from_file("test-sudokus/text/sudoku-com-12-11-12-master-solved").unwrap();
+    /// assert!(sudoku.is_solved());
+    ///
+    /// assert!(Sudoku::from_file("does-not-exist").is_err());
     /// ```
-    pub fn from_file(file_path: &str) -> Self {
-        let mut sudoku = Sudoku::empty();
-
-        for data in fs::read_to_string(file_path).expect("todo").split(";") {
-            
-            if data.len() == 0 {
-                continue;
-            }
-            if data.contains("field") {
-                let mut count = 0;
-                for c in data.chars() {
-                    if count == 81 {
-                        break;
-                    }
-                    if c >= '0' && c <= '9' {
-                        sudoku.add_number(
-                            count % 9,
-                            count / 9,
-                            c.to_digit(10)
-                                .expect("Internal Conversion Error") // This should not happen as we first check c to be confertable
-                                .try_into()
-                                .unwrap(),
-                        );
-                        count += 1;
-                    }
-                }
-            }
-
-            if data.contains(XSudoku::str_identifier()){
-                sudoku.rules.push(XSudoku::from_str(data));
-            }
-
-            if data.contains(EvenOddSudoku::str_identifier()){
-                sudoku.rules.push(EvenOddSudoku::from_str(data));
-            }
-        }
-        return sudoku;
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ParseError> {
+        fs::read_to_string(path)?.parse()
     }
 
-    /// Returns the number of already taken moves
+    /// Returns the rules of the sudoku
+    pub fn rules(&self) -> &R {
+        &self.rules
+    }
+
+    /// Returns the strategies used by [`solve`](Self::solve) and [`count_solutions`](Self::count_solutions)
+    pub fn strategies(&self) -> Strategies {
+        self.strategies
+    }
+
+    /// Chooses the strategies used by [`solve`](Self::solve) and
+    /// [`count_solutions`](Self::count_solutions). The default is [`Strategies::FASTEST`].
+    pub fn set_strategies(&mut self, strategies: Strategies) {
+        self.strategies = strategies;
+    }
+
+    /// Returns the cells, indexed as `field[row][column]`
+    pub fn field(&self) -> &Field {
+        &self.board.field
+    }
+
+    /// Returns the statistics of the moves done so far
+    pub fn moves(&self) -> &Moves {
+        &self.board.moves
+    }
+
+    /// Returns the number of moves that set a cell
     /// ```
     /// use sudoku::sudokus::Sudoku;
     ///
-    /// let mut sudoku = Sudoku::from_file("test-sudokus/text/sudoku-com-12-11-12-master-unsolved");
+    /// let mut sudoku = Sudoku::from_file("test-sudokus/text/sudoku-com-12-11-12-master-unsolved").unwrap();
+    /// let unset = sudoku.count_unset();
     /// sudoku.solve();
-    /// assert!(sudoku.count_moves() > 0);
+    /// assert_eq!(sudoku.count_moves(), unset);
     /// ```
     pub fn count_moves(&self) -> u32 {
-        return self.moves.alone_moves + self.moves.bruteforce_moves + self.moves.missing_moves;
+        self.board.moves.total()
     }
 
-    /// Returns true, if the field is set. A single Number is writen.
+    /// Returns the number of a cell or `None` if it is empty
     /// ```
     /// use sudoku::sudokus::Sudoku;
     ///
     /// let sudoku = Sudoku::example_solved();
-    /// println!("Left upper Corner is set: {}", sudoku.is_set(0, 0));
+    /// assert_eq!(sudoku.get_number(0, 0), Some(6));
+    /// assert_eq!(Sudoku::empty().get_number(0, 0), None);
     /// ```
-    #[inline]
-    pub fn is_set(&self, row: usize, collum: usize) -> bool {
-        debug_assert!(row < 9 && collum < 9);
-        return i32::count_ones(self.field[row][collum]) == 1;
+    pub fn get_number(&self, row: usize, column: usize) -> Option<u8> {
+        match self.board.field[row][column] {
+            0 => None,
+            mask => Some(mask_digit(mask)),
+        }
     }
 
-    /// Counts the number of cells in the sudoku that are not set
+    /// Returns true if the cell is set
+    pub fn is_set(&self, row: usize, column: usize) -> bool {
+        self.board.field[row][column] != 0
+    }
+
+    /// Returns the digits that can still be set in an empty cell.
+    /// For a set cell the list is empty.
     /// ```
     /// use sudoku::sudokus::Sudoku;
     ///
-    /// let sudoku = Sudoku::example_solved();
+    /// let mut sudoku = Sudoku::example_solved();
+    /// sudoku.clear(0, 0);
+    /// assert_eq!(sudoku.candidates(0, 0), vec![6]);
+    /// ```
+    pub fn candidates(&self, row: usize, column: usize) -> Vec<u8> {
+        if self.is_set(row, column) {
+            return Vec::new();
+        }
+        bits(self.board.candidates(&self.rules, row, column))
+            .map(mask_digit)
+            .collect()
+    }
+
+    /// Sets the number of a cell as a player move.
+    ///
+    /// The number may break the rules, check with [`is_part_correct`](Self::is_part_correct).
+    ///
+    /// # Panics
+    /// If `value` is not between 1 and 9.
+    ///
+    /// ```
+    /// use sudoku::sudokus::Sudoku;
+    ///
+    /// let mut sudoku = Sudoku::example_solved();
+    /// sudoku.set_number(0, 0, 9);
+    /// assert_eq!(sudoku.get_number(0, 0), Some(9));
+    /// assert!(!sudoku.is_part_correct());
+    /// ```
+    pub fn set_number(&mut self, row: usize, column: usize, value: u8) {
+        assert!((1..=9).contains(&value), "{value} is not a sudoku digit");
+        self.board.clear(row, column);
+        self.board.place(row, column, digit_mask(value));
+        self.board.moves.player_moves += 1;
+    }
+
+    /// Empties a cell
+    /// ```
+    /// use sudoku::sudokus::Sudoku;
+    ///
+    /// let mut sudoku = Sudoku::example_solved();
+    /// sudoku.clear(0, 0);
+    /// assert_eq!(sudoku.get_number(0, 0), None);
+    /// ```
+    pub fn clear(&mut self, row: usize, column: usize) {
+        self.board.clear(row, column);
+    }
+
+    /// Counts the cells that are not set
+    /// ```
+    /// use sudoku::sudokus::Sudoku;
     ///
     /// // A solved sudoku doesn't have any unset cells
-    /// assert_eq!(sudoku.count_unset(), 0);
+    /// assert_eq!(Sudoku::example_solved().count_unset(), 0);
     /// ```
     pub fn count_unset(&self) -> u32 {
-        let mut count = 0;
-        for row in 0..9 {
-            for collum in 0..9 {
-                if self.is_set(row, collum) {
-                    continue;
-                }
-
-                count += 1;
-            }
-        }
-        return count;
+        self.board.unset.into()
     }
 
-    /// Clears a cell
+    /// Returns true if all cells are set. They don't have to be correct.
+    pub fn is_solved(&self) -> bool {
+        self.board.unset == 0
+    }
+
+    /// Returns true if no rule is broken. Empty cells are ignored.
+    pub fn is_part_correct(&self) -> bool {
+        let field = &self.board.field;
+        UNITS
+            .iter()
+            .all(|unit| !has_duplicates(unit.iter().map(|&(row, column)| field[row][column])))
+            && self.rules.complies(field)
+    }
+
+    /// Returns true if the sudoku is solved correctly
     /// ```
     /// use sudoku::sudokus::Sudoku;
     ///
-    /// let mut sudoku = Sudoku::example_solved();
-    ///
-    /// // Clear the first cell
-    /// sudoku.clear(0,0);
-    ///
-    /// assert_eq!(sudoku.get_number(0,0), 0);
-    /// ```
-    pub fn clear(&mut self, row: usize, collum: usize) {
-        debug_assert!(row < 9 && collum < 9);
-        self.field[row][collum] = 0;
-    }
-
-    /// Adds the number of cell
-    ///
-    /// ```
-    /// use sudoku::sudokus::Sudoku;
-    ///
-    /// let mut sudoku = Sudoku::example_solved();
-    ///
-    /// // Clear the first cell
-    /// sudoku.clear(0,0);
-    ///
-    /// // Set it to 9
-    /// sudoku.add_number(0, 0, 9);
-    ///
-    /// assert_eq!(sudoku.get_number(0,0), 9);
-    /// ```
-    pub fn add_number(&mut self, row: usize, collum: usize, value: i32) {
-        if value == 0 {
-            return;
-        }
-        debug_assert!(value >= 1 && value <= 9);
-        debug_assert!(row < 9 && collum < 9);
-        self.field[row][collum] |= 0b1 << (value - 1);
-    }
-
-    /// Sets the number of a cell
-    ///
-    /// It behaves just like a clear follwed by
-    /// a single add
-    ///
-    /// ```
-    /// use sudoku::sudokus::Sudoku;
-    ///
-    /// let mut sudoku = Sudoku::example_solved();
-    ///
-    /// // Set it to 9
-    /// sudoku.set_number(0, 0, 9);
-    ///
-    /// assert_eq!(sudoku.get_number(0,0), 9);
-    /// ```
-    pub fn set_number(&mut self, row: usize, collum: usize, value: i32) {
-        if value == 0 {
-            return;
-        }
-        debug_assert!(value >= 1 && value <= 9);
-        debug_assert!(row < 9 && collum < 9);
-
-        self.moves.player_moves += 1;
-        self.field[row][collum] = 0b1 << (value - 1);
-    }
-
-    /// Brutforces the next number
-    /// Due to the implementation it solves the sudoku in the progress and returns true
-    /// if it is sovable. If it isn't it returns false.
-    fn brute_force(&mut self) -> bool {
-        let mut row_to_check = 9;
-        let mut collum_to_check = 9;
-        'findfield: for row in 0..9 {
-            for collum in 0..9 {
-                if !self.is_set(row, collum) {
-                    row_to_check = row;
-                    collum_to_check = collum;
-
-                    break 'findfield;
-                }
-            }
-        }
-        if row_to_check == 9 || collum_to_check == 9 {
-            return false;
-        }
-
-        let field = self.field.clone();
-        let missing_moves = self.moves.missing_moves;
-        let alone_moves = self.moves.alone_moves;
-
-        let numbers_to_check = !self.get_not_possible_numbers_raw(row_to_check, collum_to_check);
-
-        for num in 0..9 {
-            if (0b1 << num) & numbers_to_check == 0 {
-                continue;
-            }
-            self.field[row_to_check][collum_to_check] = 0b1 << num;
-
-            while !self.is_correct() && self.is_solveable() && self.single_solve() {}
-
-            if self.is_correct() {
-                self.moves.bruteforce_moves += 1;
-                return true;
-            }
-
-            self.moves.failed_alone_moves += self.moves.alone_moves - alone_moves;
-            self.moves.failed_missing_moves += self.moves.missing_moves - missing_moves;
-            self.field = field;
-            self.moves.missing_moves = missing_moves;
-            self.moves.alone_moves = alone_moves;
-            self.moves.bruteforce_failed_tries += 1;
-        }
-
-        return false;
-    }
-
-    /// Performs a single solving step
-    /// If no tactic sets a cell it calls
-    /// the bruteforce methode and theirfore solves
-    /// it recursivly
-    /// It returns true, if it is solvable, and false otherwise
-    fn single_solve(&mut self) -> bool {
-        if !self.is_solveable() {
-            return false;
-        }
-        if self.is_correct() {
-            return true;
-        }
-
-        if self.set_missing_numbers() {
-            return true;
-        }
-
-        if self.set_alone_number() {
-            return true;
-        }
-
-        return self.brute_force();
-    }
-
-    /// Solves the sudoku and returns true if it is solvable
-    /// ```
-    /// use sudoku::sudokus::Sudoku;
-    ///
-    /// let mut sudoku = Sudoku::from_file("test-sudokus/text/sudoku-com-12-11-12-master-unsolved");
-    /// sudoku.solve();
+    /// let sudoku = Sudoku::example_solved();
     /// assert!(sudoku.is_correct());
+    /// assert_eq!(sudoku.is_correct(), sudoku.is_solved() && sudoku.is_part_correct());
     /// ```
+    pub fn is_correct(&self) -> bool {
+        self.is_solved() && self.is_part_correct()
+    }
+
+    /// Solves the sudoku and returns true if it has a solution.
+    ///
+    /// If there are multiple solutions, one of them is chosen.
+    /// If there is none, the sudoku stays unchanged.
     pub fn solve(&mut self) -> bool {
-        while !self.is_correct() {
-            if !self.single_solve() {
-                return false;
-            }
+        if !self.is_part_correct() {
+            return false;
         }
 
-        return true;
+        let mut board = self.board;
+        if !board.solve(&self.rules, self.strategies) {
+            return false;
+        }
+        self.board = board;
+        true
     }
 
-    /// Removes a number from a field
-    pub fn remove_number(&mut self, row: usize, collum: usize, value: i32) {
-        debug_assert!(value >= 1 && value <= 9);
-        debug_assert!(row < 9 && collum < 9);
-        self.field[row][collum] &= !(0b1 << (value - 1));
-    }
-
-    /// Returns the number of a cell
-    /// If no or multible numbers are set it returns 0
-    pub fn get_number(&self, row: usize, collum: usize) -> i32 {
-        debug_assert!(row < 9 && collum < 9);
-        let numbers = self.get_numbers(row, collum);
-
-        if numbers.len() != 1 {
+    /// Counts the solutions, but stops searching after `limit` solutions
+    /// ```
+    /// use sudoku::sudokus::Sudoku;
+    ///
+    /// assert_eq!(Sudoku::empty().count_solutions(5), 5);
+    /// assert_eq!(Sudoku::example_solved().count_solutions(5), 1);
+    /// ```
+    pub fn count_solutions(&self, limit: usize) -> usize {
+        if limit == 0 || !self.is_part_correct() {
             return 0;
         }
-
-        return numbers[0];
+        self.board
+            .clone()
+            .count_solutions(&self.rules, self.strategies, limit)
     }
 
-    /// Gets all numbers that are set in a cell as a Vec
-    pub fn get_numbers(&self, row: usize, collum: usize) -> Vec<i32> {
-        debug_assert!(row < 9 && collum < 9);
-        let number = self.field[row][collum];
-        let mut vec = Vec::new();
-
-        for i in 0..9 {
-            if number & (0b1 << i) == 0b1 << i {
-                vec.push(i + 1);
-            }
-        }
-
-        return vec;
-    }
-
-    /// Returns true if all numbers are set
-    /// It doesnt have to be solved correctly
-    /// ```
-    /// use sudoku::sudokus::Sudoku;
-    ///
-    /// let sudoku = Sudoku::example_solved();
-    /// assert!(sudoku.is_solved());
-    /// ```
-    #[inline]
-    pub fn is_solved(&self) -> bool {
-        for row in 0..9 {
-            for collum in 0..9 {
-                if i32::count_ones(self.field[row][collum]) != 1 {
-                    return false;
-                }
-            }
-        }
-        return true;
-    }
-
-    /// Returns true if a sudoku is correctly solved
-    /// ```
-    /// use sudoku::sudokus::Sudoku;
-    ///
-    /// let sudoku = Sudoku::example_solved();
-    /// assert!(sudoku.is_correct());
-    ///
-    /// //The following is always true
-    /// assert!(sudoku.is_solved() && sudoku.is_part_correct() == sudoku.is_correct());
-    /// ```
-    #[inline]
-    pub fn is_correct(&self) -> bool {
-        //return self.is_solved() && self.is_part_correct();
-
-        for i in 0..9 {
-            let mut row_nums = 0;
-            let mut collum_nums = 0;
-            let mut square_nums = 0;
-            for j in 0..9 {
-                if row_nums & self.field[i][j] != 0
-                    || collum_nums & self.field[j][i] != 0
-                    || square_nums & self.field[i / 3 * 3 + j / 3][i % 3 * 3 + j % 3] != 0
-                    || self.field[i][j] == 0
-                {
-                    return false;
-                }
-
-                row_nums |= self.field[i][j];
-                collum_nums |= self.field[j][i];
-                square_nums |= self.field[i / 3 * 3 + j / 3][i % 3 * 3 + j % 3];
-            }
-        }
-
-        for rule in &self.rules {
-            if !rule.complys(&self.field) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    /// Returns true if their are numbers that can be set.
-    ///
-    /// It doesn't check if the sudoku has a solution.
-    #[inline]
-    fn is_solveable(&self) -> bool {
-        for row in 0..9 {
-            for collum in 0..9 {
-                if !self.is_set(row, collum)
-                    && self.get_not_possible_numbers_raw(row, collum) & 0b111_111_111
-                        == 0b111_111_111
-                {
-                    return false;
-                }
-            }
-        }
-        return true;
-    }
-
-    /// Returns true, if there are no errors
-    /// ```
-    /// use sudoku::sudokus::Sudoku;
-    ///
-    /// let sudoku = Sudoku::example_solved();
-    /// assert!(sudoku.is_part_correct());
-    /// ```
-    #[inline]
-    pub fn is_part_correct(&self) -> bool {
-        // check rows and collums
-        for i in 0..9 {
-            if !self.is_collum_part_correct(i)
-                || !self.is_row_part_correct(i)
-                || !self.is_square_part_correct(i / 3, i % 3)
-            {
-                return false;
-            }
-        }
-
-        for rule in &self.rules {
-            if !rule.complys(&self.field) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    /// Returns true if a 3x3 square is correct
-    fn is_square_part_correct(&self, big_row: usize, big_collum: usize) -> bool {
-        debug_assert!(big_row < 3 && big_collum < 3);
-        let mut set_numbers = 0;
-        for row in 0..3 {
-            for collum in 0..3 {
-                if !self.is_set(big_row * 3 + row, big_collum * 3 + collum) {
-                    continue;
-                }
-                if set_numbers & self.field[big_row * 3 + row][big_collum * 3 + collum] != 0 {
-                    return false;
-                }
-
-                set_numbers |= self.field[big_row * 3 + row][big_collum * 3 + collum];
-            }
-        }
-        return true;
-    }
-
-    /// Returns true if row is correct
-    fn is_row_part_correct(&self, row: usize) -> bool {
-        debug_assert!(row < 9);
-        let mut set_numbers = 0;
-        for collum in 0..9 {
-            if !self.is_set(row, collum) {
-                continue;
-            }
-            if set_numbers & self.field[row][collum] != 0 {
-                return false;
-            }
-
-            set_numbers |= self.field[row][collum];
-        }
-
-        return true;
-    }
-
-    /// Returns true if collum is correct
-    fn is_collum_part_correct(&self, collum: usize) -> bool {
-        debug_assert!(collum < 9);
-        let mut set_numbers = 0;
-        for row in 0..9 {
-            if !self.is_set(row, collum) {
-                continue;
-            }
-            if set_numbers & self.field[row][collum] != 0 {
-                return false;
-            }
-
-            set_numbers |= self.field[row][collum];
-        }
-
-        return true;
-    }
-
-    /// Finds and sets a missing number in the sudoku field
-    /// ```
-    /// use sudoku::sudokus::Sudoku;
-    ///
-    /// let mut sudoku = Sudoku::from_file("test-sudokus/text/tagesspiegel-23-11-11-easy-few-missing");
-    /// sudoku.set_missing_numbers();
-    /// ```
-    pub fn set_missing_numbers(&mut self) -> bool {
-        let mut number_set = false;
-        for row in 0..9 {
-            for collum in 0..9 {
-                if self.is_set(row, collum) {
-                    continue;
-                }
-
-                if self.set_missing_number(row, collum) {
-                    number_set = true;
-                    self.moves.missing_moves += 1;
-                }
-            }
-        }
-
-        return number_set;
-    }
-
-    /// Clears and adds the missing numbers in a cell
-    /// If a single number is set, it returns true
-    #[inline]
-    fn set_missing_number(&mut self, row: usize, collum: usize) -> bool {
-        debug_assert!(row < 9 && collum < 9);
-
-        let possible = 0b111_111_111 & !self.get_not_possible_numbers_raw(row, collum);
-
-        self.field[row][collum] = possible;
-
-        return i32::count_ones(possible) == 1;
-    }
-
-    /// Returns the numbers of cell that are not possible to set in the raw format
-    #[inline]
-    fn get_not_possible_numbers_raw(&self, _row: usize, _collum: usize) -> i32 {
-        debug_assert!(_row < 9 && _collum < 9);
-        let mut set = 0;
-
-        for i in 0..9 {
-            if _row != i && i32::count_ones(self.field[i][_collum]) == 1 {
-                set |= self.field[i][_collum];
-            }
-
-            if _collum != i && i32::count_ones(self.field[_row][i]) == 1 {
-                set |= self.field[_row][i];
-            }
-
-            if _row / 3 * 3 + i / 3 != _row
-                && _collum / 3 * 3 + i % 3 != _collum
-                && i32::count_ones(self.field[_row / 3 * 3 + i / 3][_collum / 3 * 3 + i % 3]) == 1
-            {
-                set |= self.field[_row / 3 * 3 + i / 3][_collum / 3 * 3 + i % 3];
-            }
-        }
-        for rule in &self.rules {
-            set |= rule.get_not_possible_numbers_raw(&self.field, _row, _collum);
-        }
-        return set;
-    }
-
-    /// Sets the first alone number
-    /// A alone number is a number that only appears once
-    /// in a row, collum or 3x3 square in the possible numbers
-    ///
-    /// The function returns true, if it was able to set a
-    /// alone number
-    /// ```
-    /// use sudoku::sudokus::Sudoku;
-    ///
-    /// let mut sudoku = Sudoku::from_file("test-sudokus/text/tagesspiegel-23-11-11-easy-few-missing");
-    /// sudoku.set_alone_number();
-    /// ```
-    pub fn set_alone_number(&mut self) -> bool {
-        for i in 0..9 {
-            if self.set_alone_number_row(i)
-                || self.set_alone_number_collum(i)
-                || self.set_alone_number_square(i / 3, i % 3)
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    /// Sets the first alone number in row
-    ///
-    /// The function returns true, if it was able to set a
-    /// alone number
-    fn set_alone_number_row(&mut self, row: usize) -> bool {
-        'numloop: for num in 0..9 {
-            let mut appearances = 0;
-            let mut alone_collum = 9;
-            for collum in 0..9 {
-                if !self.is_set(row, collum)
-                    && ((0b1 << num) & !self.get_not_possible_numbers_raw(row, collum)) != 0
-                {
-                    appearances += 1;
-                    if appearances >= 2 {
-                        continue 'numloop;
-                    }
-
-                    alone_collum = collum;
-                }
-            }
-
-            if appearances != 1 {
-                continue;
-            }
-            debug_assert!(alone_collum < 9);
-
-            self.field[row][alone_collum] = 0b1 << num;
-            self.moves.alone_moves += 1;
-            return true;
-        }
-        return false;
-    }
-
-    /// Sets the first alone number in collum
-    ///
-    /// The function returns true, if it was able to set a
-    /// alone number
-    fn set_alone_number_collum(&mut self, collum: usize) -> bool {
-        'numloop: for num in 0..9 {
-            let mut appearances = 0;
-            let mut alone_row = 9;
-            for row in 0..9 {
-                if !self.is_set(row, collum)
-                    && ((0b1 << num) & !self.get_not_possible_numbers_raw(row, collum)) != 0
-                {
-                    appearances += 1;
-                    if appearances >= 2 {
-                        continue 'numloop;
-                    }
-                    alone_row = row;
-                }
-            }
-
-            if appearances != 1 {
-                continue;
-            }
-            debug_assert!(alone_row < 9);
-
-            self.field[alone_row][collum] = 0b1 << num;
-            self.moves.alone_moves += 1;
-            return true;
-        }
-        return false;
-    }
-
-    /// Sets the first alone number in the square big_row big_collum
-    ///
-    /// The function returns true, if it was able to set a
-    /// alone number
-    fn set_alone_number_square(&mut self, big_row: usize, big_collum: usize) -> bool {
-        'numloop: for num in 0..9 {
-            let mut appearances = 0;
-            let mut alone_row = 9;
-            let mut alone_collum = 9;
-            for row in 0..3 {
-                for collum in 0..3 {
-                    if !self.is_set(big_row * 3 + row, big_collum * 3 + collum)
-                        && ((0b1 << num)
-                            & !self.get_not_possible_numbers_raw(
-                                big_row * 3 + row,
-                                big_collum * 3 + collum,
-                            ))
-                            != 0
-                    {
-                        appearances += 1;
-
-                        if appearances >= 2 {
-                            continue 'numloop;
-                        }
-
-                        alone_collum = big_collum * 3 + collum;
-                        alone_row = big_row * 3 + row;
-                    }
-                }
-            }
-
-            if appearances != 1 {
-                continue;
-            }
-            debug_assert!(alone_row < 9 && alone_collum < 9);
-
-            self.field[alone_row][alone_collum] = 0b1 << num;
-            self.moves.alone_moves += 1;
-            return true;
-        }
-        return false;
+    /// Returns true if the sudoku has exactly one solution, as a proper sudoku should
+    pub fn has_unique_solution(&self) -> bool {
+        self.count_solutions(2) == 1
     }
 }
 
 #[cfg(test)]
 mod sudoku_test {
-    use crate::sudokus::Sudoku;
+    use super::{Board, UNITS};
+    use crate::sample_files;
+    use crate::sudokus::{
+        digit_mask, FastSudoku, NoRules, ParseError, Strategies, Sudoku, ALL_DIGITS,
+    };
+
+    /// Removes all candidates of a cell except `digits`
+    fn only(board: &mut Board, row: usize, column: usize, digits: &[u8]) {
+        let keep = digits
+            .iter()
+            .fold(0, |mask, &digit| mask | digit_mask(digit));
+        board.eliminated[row][column] |= ALL_DIGITS & !keep;
+    }
 
     #[test]
-    fn set_and_get() {
+    fn equal_pairs() {
+        let masks = [0b11, 0b111, 0b11, 0, 0b101, 0, 0b101, 0b11, 0b1];
+        let pairs: Vec<_> = super::equal_pairs(masks).collect();
+        assert_eq!(
+            pairs,
+            vec![(0, 2, 0b11), (0, 7, 0b11), (2, 7, 0b11), (4, 6, 0b101)]
+        );
+    }
+
+    #[test]
+    fn naked_pairs() {
+        let mut board = Board::EMPTY;
+        // 1 and 2 have to be in (0,0) and (0,1)
+        only(&mut board, 0, 0, &[1, 2]);
+        only(&mut board, 0, 1, &[1, 2]);
+
+        assert!(board.eliminate_naked_pairs(&NoRules));
+        let pair = digit_mask(1) | digit_mask(2);
+
+        // Removed from the rest of the row and the square
+        assert_eq!(board.candidates(&NoRules, 0, 8) & pair, 0);
+        assert_eq!(board.candidates(&NoRules, 2, 2) & pair, 0);
+        // The pair itself and other cells keep them
+        assert_eq!(board.candidates(&NoRules, 0, 0), pair);
+        assert_eq!(board.candidates(&NoRules, 3, 0) & pair, pair);
+        // 7 other cells in the row, 6 more in the square
+        assert_eq!(board.moves.pair_eliminations, 2 * (7 + 6));
+
+        // Nothing new the second time
+        assert!(!board.eliminate_naked_pairs(&NoRules));
+    }
+
+    #[test]
+    fn x_wings() {
+        let mut board = Board::EMPTY;
+        // In rows 1 and 5 the 7 is only possible in columns 2 and 6
+        for row in [1, 5] {
+            for column in [0, 1, 3, 4, 5, 7, 8] {
+                board.eliminated[row][column] |= digit_mask(7);
+            }
+        }
+
+        assert!(board.eliminate_x_wings(&NoRules));
+
+        // Removed from the other cells of columns 2 and 6
+        for row in [0, 2, 3, 4, 6, 7, 8] {
+            assert_eq!(board.candidates(&NoRules, row, 2) & digit_mask(7), 0);
+            assert_eq!(board.candidates(&NoRules, row, 6) & digit_mask(7), 0);
+        }
+        // The corners and other columns keep it
+        assert_ne!(board.candidates(&NoRules, 1, 2) & digit_mask(7), 0);
+        assert_ne!(board.candidates(&NoRules, 5, 6) & digit_mask(7), 0);
+        assert_ne!(board.candidates(&NoRules, 0, 0) & digit_mask(7), 0);
+        assert_eq!(board.moves.x_wing_eliminations, 2 * 7);
+
+        assert!(!board.eliminate_x_wings(&NoRules));
+    }
+
+    #[test]
+    fn x_wings_by_columns() {
+        let mut board = Board::EMPTY;
+        // In columns 0 and 8 the 3 is only possible in rows 4 and 7
+        for column in [0, 8] {
+            for row in [0, 1, 2, 3, 5, 6, 8] {
+                board.eliminated[row][column] |= digit_mask(3);
+            }
+        }
+
+        assert!(board.eliminate_x_wings(&NoRules));
+        assert_eq!(board.candidates(&NoRules, 4, 4) & digit_mask(3), 0);
+        assert_eq!(board.candidates(&NoRules, 7, 1) & digit_mask(3), 0);
+        assert_ne!(board.candidates(&NoRules, 4, 0) & digit_mask(3), 0);
+    }
+
+    #[test]
+    fn hard_without_guessing() {
+        // Needs "Naked pairs", but no guessing anymore
+        let mut sudoku =
+            Sudoku::from_file("test-sudokus/text/welt-23-11-11-hard-unsolved").unwrap();
+        sudoku.set_strategies(Strategies::ALL);
+        assert!(sudoku.solve());
+        assert!(sudoku.moves().pair_eliminations > 0);
+        assert_eq!(sudoku.moves().bruteforce_moves, 0);
+    }
+
+    #[test]
+    fn clear_resets_eliminations() {
+        let mut sudoku =
+            Sudoku::from_file("test-sudokus/text/welt-23-11-11-hard-unsolved").unwrap();
+        let original = sudoku.clone();
+        sudoku.solve();
+
+        // Back to the start: all candidates have to be there again
+        for row in 0..9 {
+            for column in 0..9 {
+                if !original.is_set(row, column) {
+                    sudoku.clear(row, column);
+                }
+            }
+        }
+        for row in 0..9 {
+            for column in 0..9 {
+                assert_eq!(
+                    sudoku.candidates(row, column),
+                    original.candidates(row, column)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn units() {
+        for unit in UNITS {
+            let mut seen = [[false; 9]; 9];
+            for (row, column) in unit {
+                assert!(!seen[row][column]);
+                seen[row][column] = true;
+            }
+        }
+        assert_eq!(UNITS[18 + 4][4], (4, 4));
+        assert_eq!(UNITS[9 + 2][5], (5, 2));
+    }
+
+    #[test]
+    fn set_and_clear() {
         let mut sudoku = Sudoku::empty();
 
-        // Add -> check -> remove -> check
         for row in 0..9 {
-            for collum in 0..9 {
-                for i in 1..=9 {
-                    sudoku.add_number(row, collum, i);
-
-                    assert_eq!(sudoku.get_number(row, collum), i);
-
-                    sudoku.remove_number(row, collum, i);
-
-                    assert_eq!(sudoku.get_number(row, collum), 0);
+            for column in 0..9 {
+                for value in 1..=9 {
+                    sudoku.set_number(row, column, value);
+                    assert_eq!(sudoku.get_number(row, column), Some(value));
+                    assert_eq!(sudoku.count_unset(), 80);
                 }
+                sudoku.clear(row, column);
+                assert_eq!(sudoku.get_number(row, column), None);
+                assert_eq!(sudoku.count_unset(), 81);
+                assert_eq!(sudoku.candidates(row, column), (1..=9).collect::<Vec<_>>());
             }
         }
+        assert_eq!(sudoku.moves().player_moves, 81 * 9);
+    }
 
-        // multi Add -> check -> multi remove -> check
-        for row in 0..9 {
-            for collum in 0..9 {
-                for i in 1..=9 {
-                    sudoku.add_number(row, collum, i);
-                }
-                assert_eq!(sudoku.get_number(row, collum), 0);
-                for i in 1..=9 {
-                    sudoku.remove_number(row, collum, i);
-                }
-                assert_eq!(sudoku.get_number(row, collum), 0);
-            }
-        }
+    #[test]
+    fn clear_after_mistake() {
+        let mut sudoku = Sudoku::empty();
+        sudoku.set_number(0, 0, 5);
+        sudoku.set_number(0, 1, 5);
+        assert!(!sudoku.is_part_correct());
 
-        // get_numbers
-        for row in 0..9 {
-            for collum in 0..9 {
-                // Multi Add
-                let mut test_vec: Vec<i32> = Vec::new();
-                for i in 1..=9 {
-                    sudoku.add_number(row, collum, i);
-                    test_vec.push(i);
-
-                    assert_eq!(sudoku.get_numbers(row, collum), test_vec);
-                }
-
-                // Multi Remove
-                for i in (1..=9).rev() {
-                    sudoku.remove_number(row, collum, i);
-                    test_vec.pop();
-
-                    assert_eq!(sudoku.get_numbers(row, collum), test_vec);
-                }
-            }
-        }
+        // The other 5 is still in the row
+        sudoku.clear(0, 1);
+        assert!(sudoku.is_part_correct());
+        assert!(!sudoku.candidates(0, 1).contains(&5));
     }
 
     #[test]
     fn read_from_file() {
-        let mut sudoku_from_file =
-            Sudoku::from_file("test-sudokus/text/tagesspiegel-23-11-11-easy-unsolved");
+        let sudoku =
+            Sudoku::from_file("test-sudokus/text/tagesspiegel-23-11-11-easy-solved").unwrap();
+        assert_eq!(sudoku, Sudoku::example_solved());
 
-        sudoku_from_file.is_correct();
-        sudoku_from_file = Sudoku::from_file("test-sudokus/text/tagesspiegel-23-11-11-easy-solved");
+        let unsolved =
+            Sudoku::from_file("test-sudokus/text/tagesspiegel-23-11-11-easy-unsolved").unwrap();
+        assert!(!unsolved.is_solved());
+        assert!(unsolved.is_part_correct());
+    }
 
-        let mut sudoku_check = Sudoku::empty();
-        let numbers: [i32; 81] = [
-            6, 3, 5, 4, 9, 2, 1, 8, 7, 1, 7, 4, 3, 5, 8, 2, 9, 6, 2, 8, 9, 1, 7, 6, 5, 4, 3, 5, 1,
-            8, 9, 3, 7, 4, 6, 2, 7, 2, 6, 8, 4, 5, 9, 3, 1, 4, 9, 3, 6, 2, 1, 8, 7, 5, 3, 5, 1, 7,
-            8, 9, 6, 2, 4, 9, 6, 7, 2, 1, 4, 3, 5, 8, 8, 4, 2, 5, 6, 3, 7, 1, 9,
-        ];
-        let mut count = 0;
-        for num in numbers {
-            sudoku_check.add_number(count % 9, count / 9, num);
+    #[test]
+    fn parse_errors() {
+        assert!(matches!(
+            "".parse::<Sudoku>(),
+            Err(ParseError::MissingField)
+        ));
+        assert!(matches!(
+            "field: 1 2 3;".parse::<Sudoku>(),
+            Err(ParseError::WrongCellCount { found: 3, .. })
+        ));
+        assert!(matches!(
+            format!("field: {};", "0".repeat(81))
+                .repeat(2)
+                .parse::<Sudoku>(),
+            Err(ParseError::DuplicateSection(_))
+        ));
+        assert!(matches!(
+            format!("field: {}; killer-sudoku;", "0".repeat(81)).parse::<Sudoku>(),
+            Err(ParseError::UnknownSection(_))
+        ));
+        assert!(matches!(
+            FastSudoku::from_file("test-sudokus/text/sudoku-com-24-01-06-x-sudoku-easy-unsolved"),
+            Err(ParseError::UnsupportedRule(_))
+        ));
+        assert!(matches!(
+            Sudoku::from_file("test-sudokus/text/does-not-exist"),
+            Err(ParseError::Io(_))
+        ));
+    }
 
-            count += 1;
-        }
-
-        assert_eq!(sudoku_check, sudoku_from_file);
+    #[test]
+    fn display_round_trip() {
+        let sudoku = Sudoku::from_file("test-sudokus/text/welt-23-11-11-hard-unsolved").unwrap();
+        let text = format!("field:\n{sudoku};");
+        assert_eq!(text.parse::<Sudoku>().unwrap(), sudoku);
     }
 
     #[test]
     fn correct() {
-        let mut sudoku = Sudoku::from_file("test-sudokus/text/tagesspiegel-23-11-11-easy-unsolved");
-
-        assert!(!sudoku.is_solved());
-        assert!(sudoku.is_part_correct());
-
-        sudoku = Sudoku::from_file("test-sudokus/text/tagesspiegel-23-11-11-easy-solved");
-
+        let sudoku =
+            Sudoku::from_file("test-sudokus/text/tagesspiegel-23-11-11-easy-solved").unwrap();
         assert!(sudoku.is_solved());
         assert!(sudoku.is_part_correct());
         assert!(sudoku.is_correct());
 
-        sudoku = Sudoku::from_file("test-sudokus/text/tagesspiegel-23-11-11-easy-wrong");
-
+        let sudoku =
+            Sudoku::from_file("test-sudokus/text/tagesspiegel-23-11-11-easy-wrong").unwrap();
         assert!(sudoku.is_solved());
         assert!(!sudoku.is_part_correct());
         assert!(!sudoku.is_correct());
-
     }
 
     #[test]
     fn missing() {
-        let solved_sudoku =
-            Sudoku::from_file("test-sudokus/text/tagesspiegel-23-11-11-easy-solved");
+        let solved =
+            Sudoku::from_file("test-sudokus/text/tagesspiegel-23-11-11-easy-solved").unwrap();
 
-        // Easy Test that can be done in a single go
-        let mut few_sudoku =
-            Sudoku::from_file("test-sudokus/text/tagesspiegel-23-11-11-easy-few-missing");
-        few_sudoku.set_missing_numbers();
-        assert!(few_sudoku.is_correct());
-        assert_eq!(few_sudoku, solved_sudoku);
-
-        let mut some_sudoku =
-            Sudoku::from_file("test-sudokus/text/tagesspiegel-23-11-11-easy-some-missing");
-        while !some_sudoku.is_correct() && some_sudoku.set_missing_numbers() {
-            assert!(some_sudoku.is_part_correct());
-        }
-        assert!(some_sudoku.is_correct());
-        assert_eq!(some_sudoku, solved_sudoku);
-
-        // Easy Test that can be done in a single go
-        let mut easy_sudoku =
-            Sudoku::from_file("test-sudokus/text/tagesspiegel-23-11-11-easy-unsolved");
-
-        while !easy_sudoku.is_correct() {
-            easy_sudoku.set_missing_numbers();
-            assert!(easy_sudoku.is_part_correct());
-        }
-
-        assert!(easy_sudoku.is_correct());
-        assert_eq!(easy_sudoku, solved_sudoku);
-
-        // Easy Test that can be done in a single go
-        let mut easy_sudoku2 = Sudoku::from_file("test-sudokus/text/welt-23-11-11-easy-unsolved");
-
-        while !easy_sudoku2.is_correct() && easy_sudoku2.set_missing_numbers() {
-            assert!(easy_sudoku2.is_part_correct());
-        }
-        assert!(easy_sudoku2.is_correct());
-
-        // Medium Tests cant be solved this way
-        // But every step should be partialy correct
-        let mut medium_sudoku =
-            Sudoku::from_file("test-sudokus/text/welt-23-11-11-medium-unsolved");
-
-        while !medium_sudoku.is_correct() && medium_sudoku.set_missing_numbers() {
-            assert!(medium_sudoku.is_part_correct());
+        // These can be solved with "Set missing" alone
+        for path in [
+            "test-sudokus/text/tagesspiegel-23-11-11-easy-few-missing",
+            "test-sudokus/text/tagesspiegel-23-11-11-easy-some-missing",
+            "test-sudokus/text/tagesspiegel-23-11-11-easy-unsolved",
+        ] {
+            let mut sudoku = Sudoku::from_file(path).unwrap();
+            while sudoku.board.set_missing_numbers(&sudoku.rules).ok() == Some(true) {
+                assert!(sudoku.is_part_correct());
+            }
+            assert_eq!(sudoku, solved);
+            assert_eq!(sudoku.moves().alone_moves, 0);
         }
     }
 
     #[test]
     fn alone() {
-        // Easy Test that can be done in a single go
-        let mut easy_sudoku =
-            Sudoku::from_file("test-sudokus/text/tagesspiegel-23-11-11-easy-unsolved");
+        // Medium can be solved with "Set missing" and "Set alone"
+        let mut sudoku =
+            Sudoku::from_file("test-sudokus/text/welt-23-11-11-medium-unsolved").unwrap();
+        assert!(sudoku
+            .board
+            .propagate(&sudoku.rules, Strategies::ALL)
+            .is_ok());
+        assert!(sudoku.is_correct());
 
-        while !easy_sudoku.is_correct() {
-            easy_sudoku.set_missing_numbers();
-            easy_sudoku.set_alone_number();
-            assert!(easy_sudoku.is_part_correct());
-        }
-
-        assert!(easy_sudoku.is_correct());
-
-        let mut easy_sudoku2 = Sudoku::from_file("test-sudokus/text/welt-23-11-11-easy-unsolved");
-
-        while !easy_sudoku2.is_correct() && easy_sudoku2.set_missing_numbers() {
-            easy_sudoku2.set_alone_number();
-            assert!(easy_sudoku2.is_part_correct());
-        }
-        assert!(easy_sudoku2.is_correct());
-
-        // Medium Tests can finaly be solved
-        let mut medium_sudoku =
-            Sudoku::from_file("test-sudokus/text/welt-23-11-11-medium-unsolved");
-
-        while !medium_sudoku.is_correct() {
-            while !medium_sudoku.is_correct() && medium_sudoku.set_missing_numbers() {
-                assert!(medium_sudoku.is_part_correct());
+        // Hard can't, but every step has to be correct
+        let mut sudoku =
+            Sudoku::from_file("test-sudokus/text/welt-23-11-11-hard-unsolved").unwrap();
+        loop {
+            let missing = sudoku.board.set_missing_numbers(&sudoku.rules);
+            assert!(sudoku.is_part_correct());
+            if missing.ok() == Some(true) {
+                continue;
             }
-            if !medium_sudoku.set_alone_number() {
+            let alone = sudoku.board.set_alone_numbers(&sudoku.rules);
+            assert!(sudoku.is_part_correct());
+            if alone.ok() != Some(true) {
                 break;
             }
-
-            assert!(medium_sudoku.is_part_correct());
         }
-        assert!(medium_sudoku.is_correct());
-
-        // Hard cant be solved but they should be correct after every step
-        let mut hard_sudoku = Sudoku::from_file("test-sudokus/text/welt-23-11-11-hard-unsolved");
-
-        while !hard_sudoku.is_correct() {
-            while !hard_sudoku.is_correct() && hard_sudoku.set_missing_numbers() {
-                assert!(hard_sudoku.is_part_correct());
-            }
-            if !hard_sudoku.set_alone_number() {
-                break;
-            }
-
-            assert!(hard_sudoku.is_part_correct());
-        }
+        assert!(!sudoku.is_solved());
     }
 
     #[test]
     fn count_moves() {
-        for path in Sudoku::UNSOLVED_SUDOKU_FILES {
-            let mut sudoku = Sudoku::from_file(path);
+        for strategies in Strategies::all_combinations() {
+            for path in sample_files::unsolved() {
+                let mut sudoku = Sudoku::from_file(path).unwrap();
+                let unset = sudoku.count_unset();
+                // Pure guessing is too slow for the hard ones, see tests/tests.rs
+                if !strategies.set_missing && !strategies.set_alone && unset > 50 {
+                    continue;
+                }
+                sudoku.set_strategies(strategies);
 
-            let unset = sudoku.count_unset();
-
-            sudoku.solve();
-
-            assert_eq!(unset, sudoku.count_moves());
+                assert!(sudoku.solve());
+                assert_eq!(unset, sudoku.count_moves(), "{path} {strategies}");
+            }
         }
+
+        // Player moves count too
+        let mut sudoku =
+            Sudoku::from_file("test-sudokus/text/tagesspiegel-23-11-11-easy-unsolved").unwrap();
+        let unset = sudoku.count_unset();
+        sudoku.set_number(0, 2, 5);
+        assert!(sudoku.solve());
+        assert_eq!(sudoku.count_moves(), unset);
+        assert_eq!(sudoku.moves().player_moves, 1);
+    }
+
+    #[test]
+    fn no_solution() {
+        // Two 5 in the first row
+        let mut sudoku = Sudoku::empty();
+        sudoku.set_number(0, 0, 5);
+        sudoku.set_number(0, 8, 5);
+        let before = sudoku.clone();
+        assert!(!sudoku.solve());
+        assert_eq!(sudoku, before);
+        assert_eq!(sudoku.count_solutions(2), 0);
+
+        // Correct so far, but the first cell has no candidate left
+        let mut sudoku = Sudoku::empty();
+        for (column, value) in (1..9).zip(1..9) {
+            sudoku.set_number(0, column, value);
+        }
+        sudoku.set_number(1, 0, 9);
+        assert!(sudoku.is_part_correct());
+        assert!(!sudoku.solve());
+    }
+
+    #[test]
+    fn unique() {
+        for path in sample_files::unsolved() {
+            assert!(
+                Sudoku::from_file(path).unwrap().has_unique_solution(),
+                "{path}"
+            );
+        }
+
+        assert!(!Sudoku::empty().has_unique_solution());
+        assert_eq!(Sudoku::empty().count_solutions(0), 0);
     }
 }
